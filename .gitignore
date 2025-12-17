@@ -1,0 +1,92 @@
+# =========================================================
+# Trade Guardian - Ignore File
+# =========================================================
+
+# -----------------------------
+# Python runtime / build
+# -----------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# -----------------------------
+# OS / Editor noise
+# -----------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# -----------------------------
+# Logs / temp output
+# -----------------------------
+logs/
+*.log
+*.out
+*.tmp
+
+# -----------------------------
+# Trade Guardian caches (CRITICAL)
+# -----------------------------
+cache/
+**/cache/
+**/*_cache.json
+**/*_cache.pkl
+**/*_cache.parquet
+
+# HV / IV / scan caches
+hv_cache.json
+iv_cache.json
+scan_cache.json
+
+# -----------------------------
+# Data artifacts (generated, not source)
+# -----------------------------
+data/
+datasets/
+*.csv
+*.parquet
+*.feather
+
+# -----------------------------
+# CLI / experiment outputs
+# -----------------------------
+reports/
+exports/
+screenshots/
+plots/
+
+# -----------------------------
+# Secrets / local config
+# -----------------------------
+.env
+.env.*
+secrets.yaml
+secrets.json
+config.local.yaml
+config.local.json
+
+# -----------------------------
+# Jupyter / analysis notebooks
+# -----------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# -----------------------------
+# Optional: profiling / debug
+# -----------------------------
+.prof
+*.trace
