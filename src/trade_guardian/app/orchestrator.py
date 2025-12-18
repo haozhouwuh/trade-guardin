@@ -151,17 +151,23 @@ class TradeGuardian:
             ctx = ctx_map.get(row.symbol)
             if not ctx: return
 
+            # 判定逻辑：
+            # 1. 如果显式指定了 long_gamma 策略
+            # 2. 或者在 AUTO 模式下，Tag 判定为 Long Gamma (LG)
+            is_long_gamma = (self.strategy.name == "long_gamma") or ("LG" in row.tag)
+
             # === 分支 A: Long Gamma / Straddle ===
-            if self.strategy.name == "long_gamma":
-                # 直接买入 ScanRow 中选定的那个 Expiry (借用了 short_exp 字段)
+            if is_long_gamma:
+                # 这里的 row.short_exp 其实是 active expiry
                 bp = build_straddle_blueprint(
                     symbol=row.symbol,
                     underlying=row.price,
                     chain=ctx.raw_chain,
-                    exp=row.short_exp
+                    exp=row.short_exp 
                 )
                 row.blueprint = bp
                 return
+            
 
             # === 分支 B: Calendar / Default ===
             # ... (原有的 Calendar 逻辑保持不变)
