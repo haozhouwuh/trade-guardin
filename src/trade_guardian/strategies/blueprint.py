@@ -239,3 +239,73 @@ def build_straddle_blueprint(
         put_mid=put_mid,
         note=note,
     )
+
+
+@dataclass
+class DiagonalBlueprint:
+    symbol: str
+    side: str  # CALL or PUT (PMCC is CALL diagonal)
+    short_exp: str
+    short_strike: float
+    long_exp: str
+    long_strike: float
+    est_debit: Optional[float]
+    width: float  # (Short Strike - Long Strike)
+    max_loss: Optional[float] # = Debit
+    note: str
+
+    def one_liner(self) -> str:
+        debit = f"{self.est_debit:.2f}" if isinstance(self.est_debit, (int, float)) else "N/A"
+        return (
+            f"{self.symbol} DIAGONAL({self.side})  "
+            f"BUY {self.long_exp} {self.long_strike:g} / "
+            f"SELL {self.short_exp} {self.short_strike:g}  "
+            f"est_debit={debit}"
+        )
+
+def build_diagonal_blueprint(
+    *,
+    symbol: str,
+    underlying: float,
+    chain: Dict[str, Any],
+    short_exp: str,
+    long_exp: str,
+    target_short_strike: float, # 我们由策略层指定想卖哪个 Strike
+    target_long_strike: float,  # 我们由策略层指定想买哪个 Strike
+    side: str = "CALL",
+) -> Optional[DiagonalBlueprint]:
+    
+    # 1. 获取 Short Leg 价格
+    short_mid = _extract_mid_for(chain, side=side, exp=short_exp, strike=target_short_strike)
+    
+    # 2. 获取 Long Leg 价格
+    long_mid = _extract_mid_for(chain, side=side, exp=long_exp, strike=target_long_strike)
+
+    est_debit = None
+    note = ""
+
+    if isinstance(short_mid, (int, float)) and isinstance(long_mid, (int, float)):
+        est_debit = float(long_mid - short_mid)
+        
+        # [关键风控] PMCC 黄金法则检查：
+        # 宽幅 (Width) 必须大于 Debit，否则股价暴涨时会亏损
+        width = abs(target_short_strike - target_long_strike)
+        if est_debit > width:
+            note = f"WARNING: Debit ({est_debit:.2f}) > Width ({width:.2f}) - Lock-in Loss Risk!"
+        else:
+            note = f"Healthy PMCC Setup. Width={width:.2f}"
+    else:
+        note = "missing bid/ask mid for one leg"
+
+    return DiagonalBlueprint(
+        symbol=symbol,
+        side=side,
+        short_exp=short_exp,
+        short_strike=target_short_strike,
+        long_exp=long_exp,
+        long_strike=target_long_strike,
+        est_debit=est_debit,
+        width=abs(target_short_strike - target_long_strike),
+        max_loss=est_debit,
+        note=note,
+    )

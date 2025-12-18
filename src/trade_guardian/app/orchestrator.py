@@ -16,8 +16,11 @@ from trade_guardian.domain.hv import HVService
 from trade_guardian.app.renderer import ScanlistRenderer
 from trade_guardian.strategies.base import Strategy
 
-# 在文件头部引入
-from trade_guardian.strategies.blueprint import build_calendar_blueprint, build_straddle_blueprint # <--- 新增导入
+from trade_guardian.strategies.blueprint import (
+    build_calendar_blueprint, 
+    build_straddle_blueprint,
+    build_diagonal_blueprint # <--- 新增
+)
 
 class TradeGuardian:
     """
@@ -151,12 +154,25 @@ class TradeGuardian:
             ctx = ctx_map.get(row.symbol)
             if not ctx: return
 
-            # 判定逻辑：
-            # 1. 如果显式指定了 long_gamma 策略
-            # 2. 或者在 AUTO 模式下，Tag 判定为 Long Gamma (LG)
-            is_long_gamma = (self.strategy.name == "long_gamma") or ("LG" in row.tag)
+            # === 分支 A: Diagonal / PMCC (New!) ===
+            # 检查 meta 里的标记
+            meta = getattr(row, "meta", {}) or {}
+            if meta.get("strategy") == "diagonal":
+                bp = build_diagonal_blueprint(
+                    symbol=row.symbol,
+                    underlying=row.price,
+                    chain=ctx.raw_chain,
+                    short_exp=row.short_exp,
+                    long_exp=meta["long_exp"],
+                    target_short_strike=meta["short_strike"],
+                    target_long_strike=meta["long_strike"],
+                    side="CALL" # PMCC 默认做 Call
+                )
+                row.blueprint = bp
+                return
 
-            # === 分支 A: Long Gamma / Straddle ===
+            # === 分支 B: Long Gamma / Straddle ===
+            is_long_gamma = (self.strategy.name == "long_gamma") or ("LG" in row.tag)
             if is_long_gamma:
                 # 这里的 row.short_exp 其实是 active expiry
                 bp = build_straddle_blueprint(
@@ -169,7 +185,7 @@ class TradeGuardian:
                 return
             
 
-            # === 分支 B: Calendar / Default ===
+            # === 分支 C: Calendar / Default ===
             # ... (原有的 Calendar 逻辑保持不变)
             short_idx = -1
             for i, p in enumerate(ctx.term):
