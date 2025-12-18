@@ -301,7 +301,7 @@ class ScanlistRenderer:
             print(f"   • Risk avg breakdown:  base {rbd_base:+.1f} | dte {rbd_dte:+.1f} | gamma {rbd_gm:+.1f} | curv {rbd_cv:+.1f} | regime {rbd_rg:+.1f}")
         print("")
 
-# [新增辅助方法]
+    # [新增辅助方法]
     def _print_blueprints(self, title: str, rows: List[ScanRow]):
         valid_rows = [r for r in rows if getattr(r, 'blueprint', None)]
         if not valid_rows:
@@ -311,11 +311,27 @@ class ScanlistRenderer:
         print("-" * 80)
         for r in valid_rows:
             bp = r.blueprint
-            # 使用 blueprint.py 里写好的 one_liner()
+            
+            # 打印第一行摘要 (所有 Blueprint 都有 one_liner 方法)
             print(f"  {bp.one_liner()}")
-            print(f"    Note: {bp.note}")
-            print(f"    Legs: -{bp.short_exp} / +{bp.long_exp} @ Strike {bp.strike}")
+            
+            # 打印 Note
+            if getattr(bp, "note", ""):
+                print(f"    Note: {bp.note}")
+
+            # 针对不同类型的 Blueprint 打印详细腿部信息
+            # Case A: Calendar (有 short_exp / long_exp)
+            if hasattr(bp, "short_exp") and hasattr(bp, "long_exp"):
+                print(f"    Legs: -{bp.short_exp} / +{bp.long_exp} @ Strike {bp.strike}")
+            
+            # Case B: Straddle (只有 exp)
+            elif hasattr(bp, "exp"):
+                print(f"    Legs: +{bp.exp} CALL & PUT @ Strike {bp.strike}")
+            
+            # Case C: 未知类型
+            else:
+                print(f"    Legs: (Unknown structure)")
+
         print("-" * 80)
         print("")
-        
-                
+

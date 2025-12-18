@@ -17,7 +17,7 @@ from trade_guardian.app.renderer import ScanlistRenderer
 from trade_guardian.strategies.base import Strategy
 
 # 在文件头部引入
-from trade_guardian.strategies.blueprint import build_calendar_blueprint
+from trade_guardian.strategies.blueprint import build_calendar_blueprint, build_straddle_blueprint # <--- 新增导入
 
 class TradeGuardian:
     """
@@ -151,6 +151,20 @@ class TradeGuardian:
             ctx = ctx_map.get(row.symbol)
             if not ctx: return
 
+            # === 分支 A: Long Gamma / Straddle ===
+            if self.strategy.name == "long_gamma":
+                # 直接买入 ScanRow 中选定的那个 Expiry (借用了 short_exp 字段)
+                bp = build_straddle_blueprint(
+                    symbol=row.symbol,
+                    underlying=row.price,
+                    chain=ctx.raw_chain,
+                    exp=row.short_exp
+                )
+                row.blueprint = bp
+                return
+
+            # === 分支 B: Calendar / Default ===
+            # ... (原有的 Calendar 逻辑保持不变)
             short_idx = -1
             for i, p in enumerate(ctx.term):
                 if p.exp == row.short_exp:
@@ -173,13 +187,13 @@ class TradeGuardian:
                 )
                 if bp:
                     row.blueprint = bp
-                else:
-                    print(f"DEBUG: {row.symbol} build_calendar_blueprint returned None", flush=True)
-            else:
-                print(f"DEBUG: {row.symbol} No next expiry found (term list too short)", flush=True)
+                #else:
+                    #print(f"DEBUG: {row.symbol} build_calendar_blueprint returned None", flush=True)
+            #else:
+                #print(f"DEBUG: {row.symbol} No next expiry found (term list too short)", flush=True)
 
         # 2. 执行循环 (注意：这里必须和 def _attach_blueprint 对齐，不能在它里面！)
-        print(f"DEBUG: Starting Blueprint generation for {len(strict)} strict candidates...", flush=True)
+        #print(f"DEBUG: Starting Blueprint generation for {len(strict)} strict candidates...", flush=True)
         
         for r in strict:
             _attach_blueprint(r)

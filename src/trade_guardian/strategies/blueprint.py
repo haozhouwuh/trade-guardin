@@ -179,3 +179,63 @@ def build_calendar_blueprint(
         long_mid=long_mid,
         note=f"{base_note}{note_extra}", # 在备注里说明这是个对角
     )
+
+
+@dataclass
+class StraddleBlueprint:
+    symbol: str
+    exp: str
+    strike: float
+    est_debit: Optional[float]
+    call_mid: Optional[float]
+    put_mid: Optional[float]
+    note: str
+
+    def one_liner(self) -> str:
+        debit = f"{self.est_debit:.2f}" if isinstance(self.est_debit, (int, float)) else "N/A"
+        return (
+            f"{self.symbol} STRADDLE  "
+            f"BUY {self.exp} {self.strike:g} CALL/PUT  "
+            f"est_debit={debit}"
+        )
+
+def build_straddle_blueprint(
+    *,
+    symbol: str,
+    underlying: float,
+    chain: Dict[str, Any],
+    exp: str,
+) -> Optional[StraddleBlueprint]:
+    """
+    Build ATM Straddle Blueprint:
+      - Buy ATM Call
+      - Buy ATM Put
+      - Same Expiry, Same Strike
+    """
+    # 1. 找 ATM Strike
+    strikes = _extract_strikes(chain, side="CALL", exp=exp)
+    strike = _nearest_strike(underlying, strikes)
+    if strike is None:
+        return None
+
+    # 2. 获取 Call 和 Put 的价格
+    call_mid = _extract_mid_for(chain, side="CALL", exp=exp, strike=strike)
+    put_mid = _extract_mid_for(chain, side="PUT", exp=exp, strike=strike)
+
+    est_debit = None
+    note = "ATM strike chosen"
+
+    if isinstance(call_mid, (int, float)) and isinstance(put_mid, (int, float)):
+        est_debit = float(call_mid + put_mid)
+    else:
+        note = "missing bid/ask mid for legs"
+
+    return StraddleBlueprint(
+        symbol=symbol,
+        exp=exp,
+        strike=float(strike),
+        est_debit=est_debit,
+        call_mid=call_mid,
+        put_mid=put_mid,
+        note=note,
+    )

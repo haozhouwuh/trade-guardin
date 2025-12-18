@@ -4,6 +4,8 @@ from trade_guardian.domain.policy import ShortLegPolicy
 
 from trade_guardian.strategies.calendar import CalendarStrategy
 from trade_guardian.strategies.hv_calendar import HVCalendarStrategy
+# [新增] 必须导入新写的策略类
+from trade_guardian.strategies.long_gamma import LongGammaStrategy
 
 
 class StrategyRegistry:
@@ -19,5 +21,10 @@ class StrategyRegistry:
 
         if n in ("hv_calendar", "hvcal", "hv"):
             return HVCalendarStrategy(self.cfg, self.policy)
+            
+        # [新增] 这里注册关键字，让 CLI 能识别 "long_gamma"
+        if n in ("long_gamma", "gamma", "straddle", "lg"):
+            return LongGammaStrategy(self.cfg, self.policy)
 
-        raise KeyError(f"Unknown strategy: {name}. Available: calendar, hv_calendar")
+        # 更新报错信息，提示用户支持的新策略
+        raise KeyError(f"Unknown strategy: {name}. Available: calendar, hv_calendar, long_gamma")

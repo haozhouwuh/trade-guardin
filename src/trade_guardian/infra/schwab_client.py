@@ -85,13 +85,13 @@ class SchwabClient:
         except Exception as e:
             return HVInfo(status="Error", msg=str(e))
 
-    def _fetch_calls_chain(self, symbol: str, from_d: str, to_d: str, range_val: str = "ATM") -> dict:   
+    def _fetch_calls_chain(self, symbol: str, from_d: str, to_d: str, range_val: str = "NTM") -> dict:
         params = {
             "symbol": symbol,
-            "contractType": "CALL",
+            "contractType": "ALL",  # <--- [关键修改] 原来是 "CALL"，改为 "ALL" 以获取 Put
             "includeUnderlyingQuote": "true",
             "strategy": "SINGLE",
-            "range": range_val,
+            "range": range_val,  # 保持你之前改的 "ALL" 或 "NTM"
             "fromDate": from_d,
             "toDate": to_d,
         }
