@@ -124,36 +124,58 @@ def build_calendar_blueprint(
     prefer_side: str = "CALL",
 ) -> Optional[CalendarBlueprint]:
     """
-    Build ATM calendar blueprint:
+    Build ATM calendar (or diagonal) blueprint:
       - Choose nearest strike by underlying using short expiry strikes universe
-      - Use same strike for long expiry
-      - Estimate debit = long_mid - short_mid
+      - Try to use same strike for long expiry
+      - IF missing, find nearest available strike in long expiry (Fuzzy Match)
     """
     side = prefer_side.upper()
-    strikes = _extract_strikes(chain, side=side, exp=short_exp)
-    strike = _nearest_strike(underlying, strikes)
-    if strike is None:
+    
+    # 1. 确定 Short Leg 的 Strike (锚点)
+    strikes_short = _extract_strikes(chain, side=side, exp=short_exp)
+    strike_short = _nearest_strike(underlying, strikes_short)
+    if strike_short is None:
         return None
 
-    short_mid = _extract_mid_for(chain, side=side, exp=short_exp, strike=strike)
-    long_mid = _extract_mid_for(chain, side=side, exp=long_exp, strike=strike)
+    # 2. 获取 Short Leg 价格
+    short_mid = _extract_mid_for(chain, side=side, exp=short_exp, strike=strike_short)
+
+    # 3. 尝试获取 Long Leg 价格 (优先精确匹配)
+    strike_long = strike_short
+    long_mid = _extract_mid_for(chain, side=side, exp=long_exp, strike=strike_long)
+    
+    note_extra = ""
+
+    # 4. [新增逻辑] 模糊匹配：如果 Long Leg 没有这个价，就找最近的
+    if long_mid is None:
+        strikes_long = _extract_strikes(chain, side=side, exp=long_exp)
+        strike_long_candidate = _nearest_strike(strike_short, strikes_long)
+        
+        if strike_long_candidate is not None:
+            # 找到了替代品
+            strike_long = strike_long_candidate
+            long_mid = _extract_mid_for(chain, side=side, exp=long_exp, strike=strike_long)
+            
+            # 记录一下偏移
+            diff = strike_long - strike_short
+            note_extra = f" (Diagonal: Long {strike_long:g})"
 
     est_debit = None
-    note = "ATM strike chosen"
+    base_note = "ATM strike chosen"
+    
     if isinstance(short_mid, (int, float)) and isinstance(long_mid, (int, float)):
         est_debit = float(long_mid - short_mid)
-
-    if short_mid is None or long_mid is None:
-        note = "missing bid/ask mid for one leg (check chain liquidity/shape)"
+    else:
+        base_note = "missing bid/ask mid"
 
     return CalendarBlueprint(
         symbol=symbol,
         side=side,
         short_exp=short_exp,
         long_exp=long_exp,
-        strike=float(strike),
+        strike=float(strike_short), # 这里的 strike 依然记录 Short Leg 的，保持表格整洁
         est_debit=est_debit,
         short_mid=short_mid,
         long_mid=long_mid,
-        note=note,
+        note=f"{base_note}{note_extra}", # 在备注里说明这是个对角
     )

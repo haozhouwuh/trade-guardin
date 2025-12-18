@@ -85,7 +85,7 @@ class SchwabClient:
         except Exception as e:
             return HVInfo(status="Error", msg=str(e))
 
-    def _fetch_calls_chain(self, symbol: str, from_d: str, to_d: str, range_val: str = "ATM") -> dict:
+    def _fetch_calls_chain(self, symbol: str, from_d: str, to_d: str, range_val: str = "ATM") -> dict:   
         params = {
             "symbol": symbol,
             "contractType": "CALL",
@@ -105,7 +105,7 @@ class SchwabClient:
                 return retry.json()
         return {}
 
-    def scan_atm_term(self, symbol: str, days: int, contract_type: str = "CALL") -> tuple[float, list[TermPoint]]:
+    def scan_atm_term(self, symbol: str, days: int, contract_type: str = "CALL") -> tuple[float, list[TermPoint], dict]:
         q = self.get_quote(symbol)
         price = q.get("lastPrice") or q.get("closePrice") or q.get("mark")
         if not price:
@@ -114,7 +114,12 @@ class SchwabClient:
 
         from_date = datetime.now().strftime("%Y-%m-%d")
         to_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-        chain = self._fetch_calls_chain(symbol, from_date, to_date, range_val="ATM")
+
+        # ... (获取 chain 的代码)
+        #chain = self._fetch_calls_chain(symbol, from_date, to_date, range_val="ATM")
+        #chain = self._fetch_calls_chain(symbol, from_date, to_date, range_val="NTM")
+        chain = self._fetch_calls_chain(symbol, from_date, to_date, range_val="ALL")
+
         call_map = chain.get("callExpDateMap") or {}
         if not call_map:
             raise RuntimeError("No option chain data returned.")
@@ -172,4 +177,4 @@ class SchwabClient:
         if not term:
             raise RuntimeError("Could not build term points.")
 
-        return price, term
+        return price, term, chain

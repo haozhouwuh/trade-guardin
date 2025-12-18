@@ -16,6 +16,8 @@ from trade_guardian.domain.hv import HVService
 from trade_guardian.app.renderer import ScanlistRenderer
 from trade_guardian.strategies.base import Strategy
 
+# 在文件头部引入
+from trade_guardian.strategies.blueprint import build_calendar_blueprint
 
 class TradeGuardian:
     """
@@ -49,16 +51,20 @@ class TradeGuardian:
         vix = self.client.get_market_vix()
         hv = self.hv_service.get_hv(symbol)
 
-        price, term = self.client.scan_atm_term(
+        # [修改] 接收 raw_chain
+        price, term, raw_chain = self.client.scan_atm_term(
             symbol,
             days,
             contract_type=self.cfg["scan"]["contract_type"],
         )
         tsf = self.tsf_builder.build(term, hv, rank=base_rank)
+
         if tsf.get("status") != "Success":
             raise RuntimeError(tsf.get("msg", "TSF error"))
 
-        return Context(symbol=symbol, price=price, vix=vix, term=term, hv=hv, tsf=tsf)
+        # [修改] 传入 raw_chain
+        return Context(symbol=symbol, price=price, vix=vix, term=term, hv=hv, tsf=tsf, raw_chain=raw_chain)
+    
 
     def scanlist(self, days: int, min_score: int, max_risk: int, limit: int = 0, detail: bool = False):
         """
@@ -136,8 +142,53 @@ class TradeGuardian:
         still_watch.sort(key=_sort_key_score, reverse=True)
         top = sorted(rows, key=_sort_key_score, reverse=True)
 
+        # ------------------------------------------------------------------
+        # GENERATE BLUEPRINTS (Strategy #3 Implementation)
+        # ------------------------------------------------------------------
+        
+        # 1. 定义内部函数
+        def _attach_blueprint(row: ScanRow):
+            ctx = ctx_map.get(row.symbol)
+            if not ctx: return
+
+            short_idx = -1
+            for i, p in enumerate(ctx.term):
+                if p.exp == row.short_exp:
+                    short_idx = i
+                    break
+            
+            # 调试打印
+            #print(f"DEBUG: {row.symbol} short_exp={row.short_exp} short_idx={short_idx} total_term_len={len(ctx.term)}", flush=True)
+
+            if short_idx != -1 and short_idx + 1 < len(ctx.term):
+                long_point = ctx.term[short_idx + 1]
+                
+                bp = build_calendar_blueprint(
+                    symbol=row.symbol,
+                    underlying=row.price,
+                    chain=ctx.raw_chain,
+                    short_exp=row.short_exp,
+                    long_exp=long_point.exp,
+                    prefer_side="CALL"
+                )
+                if bp:
+                    row.blueprint = bp
+                else:
+                    print(f"DEBUG: {row.symbol} build_calendar_blueprint returned None", flush=True)
+            else:
+                print(f"DEBUG: {row.symbol} No next expiry found (term list too short)", flush=True)
+
+        # 2. 执行循环 (注意：这里必须和 def _attach_blueprint 对齐，不能在它里面！)
+        print(f"DEBUG: Starting Blueprint generation for {len(strict)} strict candidates...", flush=True)
+        
+        for r in strict:
+            _attach_blueprint(r)
+            
+        for r in top[:3]: 
+            if r.blueprint is None: # 避免重复计算
+                _attach_blueprint(r)
+
         # Renderer is responsible for printing thresholds consistently.
-        # We pass the same min_score/max_risk used above, so “printed rule” == “actual rule”.
         self.renderer.render(
             days=days,
             universe_size=len(rows),

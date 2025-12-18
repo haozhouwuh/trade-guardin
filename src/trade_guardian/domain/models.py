@@ -114,6 +114,9 @@ class ScanRow:
 
     rec: Optional[Recommendation] = None
     probe_summary: str = ""
+    
+    # [新增] 存放生成的交易蓝图
+    blueprint: Any = None # 实际上是 Optional[CalendarBlueprint]
 
 
 @dataclass
@@ -124,3 +127,5 @@ class Context:
     term: List[TermPoint]
     hv: HVInfo
     tsf: Dict[str, Any]
+    # [新增] 保留原始 Chain 数据，供 Blueprint 查找报价
+    raw_chain: Dict[str, Any] = field(default_factory=dict)

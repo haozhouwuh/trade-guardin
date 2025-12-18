@@ -250,6 +250,9 @@ class ScanlistRenderer:
         print("  • Example: FS = Flat + Spiky front; CS = Contango + Spiky front")
         print("")
 
+        # [新增] 打印交易蓝图
+        self._print_blueprints("🚀 Actionable Blueprints (Strategy #3)", strict)
+
         if errors:
             print(f"{Fore.RED}Errors (first 15):{Style.RESET_ALL}")
             for sym, msg in errors[:15]:
@@ -297,3 +300,22 @@ class ScanlistRenderer:
         if rbds:
             print(f"   • Risk avg breakdown:  base {rbd_base:+.1f} | dte {rbd_dte:+.1f} | gamma {rbd_gm:+.1f} | curv {rbd_cv:+.1f} | regime {rbd_rg:+.1f}")
         print("")
+
+# [新增辅助方法]
+    def _print_blueprints(self, title: str, rows: List[ScanRow]):
+        valid_rows = [r for r in rows if getattr(r, 'blueprint', None)]
+        if not valid_rows:
+            return
+
+        print(title)
+        print("-" * 80)
+        for r in valid_rows:
+            bp = r.blueprint
+            # 使用 blueprint.py 里写好的 one_liner()
+            print(f"  {bp.one_liner()}")
+            print(f"    Note: {bp.note}")
+            print(f"    Legs: -{bp.short_exp} / +{bp.long_exp} @ Strike {bp.strike}")
+        print("-" * 80)
+        print("")
+        
+                
