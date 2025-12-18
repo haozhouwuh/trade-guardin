@@ -1,66 +1,170 @@
 from __future__ import annotations
 
-import os
-from typing import List, Tuple
+from typing import Any, List, Optional, Tuple
 
-import numpy as np
-from tabulate import tabulate
-from colorama import Fore, Style
+try:
+    from colorama import Fore, Style
+except Exception:  # pragma: no cover
+    class _Dummy:
+        RESET_ALL = ""
+    class _Fore(_Dummy):
+        CYAN = ""
+        GREEN = ""
+        YELLOW = ""
+        RED = ""
+        MAGENTA = ""
+    class _Style(_Dummy):
+        RESET_ALL = ""
+    Fore = _Fore()
+    Style = _Style()
+
+try:
+    from tabulate import tabulate
+except Exception:  # pragma: no cover
+    tabulate = None
 
 from trade_guardian.domain.models import ScanRow
 from trade_guardian.domain.policy import ShortLegPolicy
 
 
 class ScanlistRenderer:
-    def __init__(self, cfg: dict, policy: ShortLegPolicy, hv_cache_path: str):
+    def __init__(self, cfg: dict, policy: ShortLegPolicy, hv_cache_path: str = ""):
         self.cfg = cfg
         self.policy = policy
         self.hv_cache_path = hv_cache_path
 
-    # -------------------- utils --------------------
-
-    @staticmethod
-    def _fmt_float(x, n: int = 2) -> str:
+    # ---------------------------
+    # formatting helpers
+    # ---------------------------
+    def _fmt_pct(self, x: float, digits: int = 1) -> str:
+        """
+        Accept both:
+        - decimal IV: 0.129 -> 12.9%
+        - percent IV: 12.9  -> 12.9%
+        Heuristic: values > 3 are treated as already-percent.
+        """
         try:
-            return f"{x:.{n}f}"
+            v = float(x)
         except Exception:
             return "N/A"
 
-    @staticmethod
-    def _tab(headers, rows):
+        if v != v:  # NaN
+            return "N/A"
+
+        pct = v if abs(v) > 3.0 else (v * 100.0)
+        return f"{pct:.{digits}f}%"
+
+    def _fmt_float(self, x: Any, digits: int = 2) -> str:
+        try:
+            return f"{float(x):.{digits}f}"
+        except Exception:
+            return "N/A"
+
+    def _fmt_edge(self, x: float) -> str:
+        try:
+            return f"{float(x):.2f}x"
+        except Exception:
+            return "N/A"
+
+    def _policy_probe_range_str(self) -> str:
+        """
+        Never rely on internal policy attributes.
+        Use stable method: probe_ranks().
+        """
+        try:
+            ranks = list(self.policy.probe_ranks())
+        except Exception:
+            ranks = [getattr(self.policy, "base_rank", 1)]
+
+        if not ranks:
+            return "-"
+
+        lo = min(ranks)
+        hi = max(ranks)
+        return f"{lo}..{hi}"
+
+    # ---------------------------
+    # tables
+    # ---------------------------
+    def _print_table(self, title: str, rows: List[ScanRow], kind: str):
+        """
+        kind:
+          - "base": show ScanRow chosen short leg
+          - "auto": show recommendation fields (rec_*)
+        """
         if not rows:
-            print(Fore.YELLOW + "  (none)\n" + Style.RESET_ALL)
+            print(f"{title}\n  (none)\n")
             return
-        print(tabulate(rows, headers=headers, tablefmt="simple"))
+
+        if tabulate is None:
+            print(title)
+            for r in rows:
+                print(f"  {r.symbol} score={r.cal_score} risk={r.short_risk} tag={r.tag}")
+            print("")
+            return
+
+        if kind == "auto":
+            headers = [
+                "Sym", "Px",
+                "ShortExp", "ShortDTE", "ShortIV",
+                "RecExp", "RecDTE", "RecIV",
+                "RecEdge", "RecScore", "RecRisk", "RecTag",
+            ]
+            table = []
+            for r in rows:
+                rec = r.rec
+                table.append([
+                    r.symbol,
+                    self._fmt_float(r.price, 2),
+                    r.short_exp, r.short_dte, self._fmt_pct(r.short_iv, 1),
+                    rec.rec_exp if rec else "-",
+                    rec.rec_dte if rec else "-",
+                    self._fmt_pct(rec.rec_iv, 1) if rec else "-",
+                    self._fmt_edge(rec.rec_edge) if rec else "-",
+                    rec.rec_score if rec else "-",
+                    rec.rec_risk if rec else "-",
+                    rec.rec_tag if rec else "-",
+                ])
+            print(title)
+            print(tabulate(table, headers=headers, tablefmt="simple"))
+            print("")
+            return
+
+        headers = ["Sym", "Px", "ShortExp", "ShortDTE", "ShortIV", "BaseIV", "Edge", "HV%", "Score", "Risk", "Tag"]
+        table = []
+        for r in rows:
+            table.append([
+                r.symbol,
+                self._fmt_float(r.price, 2),
+                r.short_exp,
+                r.short_dte,
+                self._fmt_pct(r.short_iv, 1),
+                self._fmt_pct(r.base_iv, 1),
+                self._fmt_edge(r.edge),
+                f"{r.hv_rank:.0f}%",
+                r.cal_score,
+                r.short_risk,
+                r.tag,
+            ])
+        print(title)
+        print(tabulate(table, headers=headers, tablefmt="simple"))
         print("")
 
-    @staticmethod
-    def _tag_legend():
-        print(f"{Fore.CYAN}Tag Legend{Style.RESET_ALL}")
-        print("  • First letter (Regime): F=FLAT, C=CONTANGO, B=BACKWARDATION")
-        print("  • S suffix (Curvature): S=SPIKY_FRONT")
-        print("  • Example: FS = Flat + Spiky front; CS = Contango + Spiky front\n")
-
-    @staticmethod
-    def _explain_legend():
-        # Keep tight, human-friendly, one-time legend for detail mode.
-        print(f"{Fore.CYAN}Explain legend{Style.RESET_ALL}")
-        print("  score parts: b=base, rg=regime, ed=edge, hv=HV-rank slot, cv=curvature, pen=penalties")
-        print("  risk  parts: b=base, dte=time-to-expiry, gm=gamma proxy, cv=curvature risk, rg=regime risk, pen=penalties\n")
-
-    # -------------------- detail --------------------
-
+    # ---------------------------
+    # details
+    # ---------------------------
     def _detail_lines(self, title: str, rows: List[ScanRow], limit: int = 15):
         if not rows:
             return
 
         print(f"{Fore.CYAN}{title} details (per-row explain){Style.RESET_ALL}")
-        self._explain_legend()
 
-        squeeze_thr = self.cfg.get("risk", {}).get("squeeze_threshold", None)
+        print("Explain legend")
+        print("  score parts: b=base, rg=regime, ed=edge, hv=HV-rank slot, cv=curvature, pen=penalties")
+        print("  risk  parts: b=base, dte=time-to-expiry, gm=gamma proxy, cv=curvature risk, rg=regime risk, pen=penalties")
+        print("")
 
         for r in rows[:limit]:
-            # ----- score breakdown -----
             bd = r.score_breakdown
             pen = getattr(bd, "penalties", 0)
             pen_str = f" pen{pen:+d}" if pen else ""
@@ -72,7 +176,6 @@ class ScanlistRenderer:
                 f"| edge={self._fmt_float(r.edge)}x tag={r.tag} hv={r.hv_rank:.0f}%"
             )
 
-            # ----- risk breakdown -----
             rbd = getattr(r, "risk_breakdown", None)
             if rbd is None:
                 print(f"         risk={r.short_risk:<3d} | short={r.short_exp} d{r.short_dte}")
@@ -82,37 +185,30 @@ class ScanlistRenderer:
             r_pen_str = f" pen{r_pen:+d}" if r_pen else ""
 
             squeeze = getattr(r, "squeeze_ratio", None)
-            squeeze_str = (
-                f" | squeeze={self._fmt_float(squeeze,2)}x"
-                if isinstance(squeeze, (int, float))
-                else ""
-            )
+            squeeze_str = f" | squeeze={self._fmt_float(squeeze, 2)}x" if isinstance(squeeze, (int, float)) else ""
 
             print(
                 f"         risk={r.short_risk:<3d} "
-                f"[b{rbd.base:+d} "
-                f"dte{getattr(rbd,'dte',0):+d} "
-                f"gm{getattr(rbd,'gamma',0):+d} "
-                f"cv{getattr(rbd,'curv',0):+d} "
+                f"[b{getattr(rbd,'base',0):+d} dte{getattr(rbd,'dte',0):+d} "
+                f"gm{getattr(rbd,'gamma',0):+d} cv{getattr(rbd,'curv',0):+d} "
                 f"rg{getattr(rbd,'regime',0):+d}{r_pen_str}] "
                 f"| short={r.short_exp} d{r.short_dte}{squeeze_str}"
             )
 
-            # ----- curvature explain (human-friendly) -----
-            if "S" in r.tag and getattr(rbd, "curv", 0) == 0:
-                thr_str = str(squeeze_thr) if squeeze_thr is not None else "N/A"
-                sq_str = self._fmt_float(squeeze, 2) if isinstance(squeeze, (int, float)) else "N/A"
-                print(
-                    f"         note: SPIKY_FRONT tag detected, but curvature risk not added "
-                    f"(squeeze={sq_str}x, threshold={thr_str})"
-                )
+            if "S" in str(r.tag) and getattr(rbd, "curv", 0) == 0:
+                thr = getattr(r, "squeeze_threshold", None)
+                thr_str = f"{self._fmt_float(thr, 2)}x" if isinstance(thr, (int, float)) else "N/A"
+                sq_str = f"{self._fmt_float(squeeze, 2)}x" if isinstance(squeeze, (int, float)) else "N/A"
+                print(f"         note: SPIKY_FRONT tag detected, but curvature risk not added (squeeze={sq_str}, threshold={thr_str})")
 
         print("")
 
-    # -------------------- main render --------------------
-
+    # ---------------------------
+    # main render
+    # ---------------------------
     def render(
         self,
+        *,
         days: int,
         universe_size: int,
         min_score: int,
@@ -122,101 +218,82 @@ class ScanlistRenderer:
         watch: List[ScanRow],
         top: List[ScanRow],
         errors: List[Tuple[str, str]],
-        detail: bool
+        detail: bool = False,
     ):
-        print(f"\n{Fore.CYAN}{'='*95}")
+        print("")
+        print("=" * 95)
         print(f"🧠 TRADE GUARDIAN :: SCANLIST (days={days})")
-        print(f"{'='*95}{Style.RESET_ALL}")
+        print("=" * 95)
 
-        ranks = self.policy.probe_ranks()
-        probe_str = f"{ranks[0]}..{ranks[-1]}" if ranks else "-"
-        print(
-            f"Short leg policy: base_rank={self.policy.base_rank}, "
-            f"min_dte={self.policy.min_dte}, probe_ranks={probe_str}"
-        )
-        print(
-            f"Universe size: {universe_size} | "
-            f"Strict: {len(strict)} | AutoAdjusted: {len(auto_adjusted)} | "
-            f"Watch: {len(watch)} | Errors: {len(errors)}"
-        )
+        probe_range = self._policy_probe_range_str()
+        base_rank = getattr(self.policy, "base_rank", "N/A")
+        min_dte = getattr(self.policy, "min_dte", "N/A")
+
+        print(f"Short leg policy: base_rank={base_rank}, min_dte={min_dte}, probe_ranks={probe_range}")
+        print(f"Universe size: {universe_size} | Strict: {len(strict)} | AutoAdjusted: {len(auto_adjusted)} | Watch: {len(watch)} | Errors: {len(errors)}")
         print(f"Strict Filter: cal_score >= {min_score}, short_risk <= {max_risk}")
-        print(
-            f"Throttle: {self.cfg['scan']['throttle_sec']:.2f}s/ticker | "
-            f"HV cache: {os.path.relpath(self.hv_cache_path)}\n"
-        )
+        throttle = float(self.cfg.get("scan", {}).get("throttle_sec", 0.5))
+        print(f"Throttle: {throttle:.2f}s/ticker | HV cache: {self.hv_cache_path}")
+        print("")
 
-        print(f"{Fore.CYAN}🏆 Top Overall (ranked by score + edge + lower risk){Style.RESET_ALL}")
-        top_rows = [[
-            r.symbol, f"{r.price:.2f}", r.short_exp, r.short_dte,
-            f"{r.short_iv:.1f}%", f"{r.base_iv:.1f}%",
-            f"{r.edge:.2f}x", f"{r.hv_rank:.0f}%",
-            r.cal_score, r.short_risk, r.tag
-        ] for r in top]
-        self._tab(
-            ["Sym","Px","ShortExp","ShortDTE","ShortIV","BaseIV","Edge","HV%","Score","Risk","Tag"],
-            top_rows[:15]
-        )
+        self._print_table(f"{Fore.GREEN}✅ Strict Candidates (actionable now){Style.RESET_ALL}", strict, kind="base")
+        self._print_table(f"{Fore.MAGENTA}🤖 Auto-Adjusted Candidates (recommended rank within probe range){Style.RESET_ALL}", auto_adjusted, kind="auto")
+        self._print_table(f"{Fore.YELLOW}👀 Watchlist (score OK but still risky within probe range){Style.RESET_ALL}", watch, kind="base")
+        self._print_table(f"{Fore.CYAN}🏆 Top Overall (ranked by score + edge + lower risk){Style.RESET_ALL}", top, kind="base")
 
-        if detail:
-            self._detail_lines("Top", top)
+        if detail and top:
+            self._detail_lines("Top", top, limit=15)
 
-        self._tag_legend()
+        print("Tag Legend")
+        print("  • First letter (Regime): F=FLAT, C=CONTANGO, B=BACKWARDATION")
+        print("  • S suffix (Curvature): S=SPIKY_FRONT")
+        print("  • Example: FS = Flat + Spiky front; CS = Contango + Spiky front")
+        print("")
 
         if errors:
-            print(Fore.YELLOW + "Errors (first 15):" + Style.RESET_ALL)
+            print(f"{Fore.RED}Errors (first 15):{Style.RESET_ALL}")
             for sym, msg in errors[:15]:
                 print(f"  - {sym}: {msg}")
             print("")
 
-    # -------------------- diagnostics --------------------
-
-    def render_diagnostics(
-        self,
-        rows: List[ScanRow],
-        min_score: int,
-        max_risk: int,
-        strict: List[ScanRow],
-        auto_adjusted: List[ScanRow],
-        detail: bool
-    ):
+    # ---------------------------
+    # diagnostics
+    # ---------------------------
+    def render_diagnostics(self, *, rows: List[ScanRow], **_kwargs):
+        """
+        Backward/forward compatible:
+        orchestrator might pass min_score/max_risk/etc.
+        We accept them and ignore here.
+        """
         if not rows:
             return
 
-        avg_score = float(np.mean([r.cal_score for r in rows]))
-        avg_risk = float(np.mean([r.short_risk for r in rows]))
-        avg_dte = float(np.mean([r.short_dte for r in rows]))
-        avg_edge = float(np.mean([r.edge for r in rows]))
+        def avg(nums: List[float]) -> float:
+            return sum(nums) / max(1, len(nums))
 
-        print(f"{Fore.YELLOW}🧾 Diagnostics{Style.RESET_ALL}")
-        print(
-            f"   • Avg CalScore: {avg_score:.1f} | "
-            f"Avg ShortRisk: {avg_risk:.1f} | "
-            f"Avg ShortDTE: {avg_dte:.1f} | "
-            f"Avg Edge(S/B): {avg_edge:.2f}x"
-        )
+        avg_score = avg([float(r.cal_score) for r in rows])
+        avg_risk = avg([float(r.short_risk) for r in rows])
+        avg_dte = avg([float(r.short_dte) for r in rows])
+        avg_edge = avg([float(r.edge) for r in rows])
 
-        # ---- score breakdown avg ----
-        bd_list = [r.score_breakdown for r in rows]
-        print(
-            f"   • Score avg breakdown: "
-            f"base {np.mean([b.base for b in bd_list]):+.1f} | "
-            f"regime {np.mean([b.regime for b in bd_list]):+.1f} | "
-            f"edge {np.mean([b.edge for b in bd_list]):+.1f} | "
-            f"hv {np.mean([b.hv for b in bd_list]):+.1f} | "
-            f"curv {np.mean([b.curvature for b in bd_list]):+.1f}"
-        )
+        bds = [r.score_breakdown for r in rows if getattr(r, "score_breakdown", None) is not None]
+        bd_base = avg([float(bd.base) for bd in bds]) if bds else 0.0
+        bd_reg = avg([float(bd.regime) for bd in bds]) if bds else 0.0
+        bd_edge = avg([float(bd.edge) for bd in bds]) if bds else 0.0
+        bd_hv = avg([float(bd.hv) for bd in bds]) if bds else 0.0
+        bd_curv = avg([float(bd.curvature) for bd in bds]) if bds else 0.0
 
-        # ---- risk breakdown avg ----
-        rbd_list = [getattr(r, "risk_breakdown", None) for r in rows]
-        rbd_list = [x for x in rbd_list if x is not None]
-        if rbd_list:
-            print(
-                f"   • Risk avg breakdown:  "
-                f"base {np.mean([x.base for x in rbd_list]):+.1f} | "
-                f"dte {np.mean([getattr(x,'dte',0) for x in rbd_list]):+.1f} | "
-                f"gamma {np.mean([getattr(x,'gamma',0) for x in rbd_list]):+.1f} | "
-                f"curv {np.mean([getattr(x,'curv',0) for x in rbd_list]):+.1f} | "
-                f"regime {np.mean([getattr(x,'regime',0) for x in rbd_list]):+.1f}"
-            )
+        rbds = [getattr(r, "risk_breakdown", None) for r in rows]
+        rbds = [x for x in rbds if x is not None]
+        rbd_base = avg([float(getattr(x, "base", 0)) for x in rbds]) if rbds else 0.0
+        rbd_dte = avg([float(getattr(x, "dte", 0)) for x in rbds]) if rbds else 0.0
+        rbd_gm = avg([float(getattr(x, "gamma", 0)) for x in rbds]) if rbds else 0.0
+        rbd_cv = avg([float(getattr(x, "curv", 0)) for x in rbds]) if rbds else 0.0
+        rbd_rg = avg([float(getattr(x, "regime", 0)) for x in rbds]) if rbds else 0.0
 
+        print(f"{Fore.CYAN}🧾 Diagnostics{Style.RESET_ALL}")
+        print(f"   • Avg CalScore: {avg_score:.1f} | Avg ShortRisk: {avg_risk:.1f} | Avg ShortDTE: {avg_dte:.1f} | Avg Edge(S/B): {avg_edge:.2f}x")
+        print(f"   • Score avg breakdown: base {bd_base:+.1f} | regime {bd_reg:+.1f} | edge {bd_edge:+.1f} | hv {bd_hv:+.1f} | curv {bd_curv:+.1f}")
+        if rbds:
+            print(f"   • Risk avg breakdown:  base {rbd_base:+.1f} | dte {rbd_dte:+.1f} | gamma {rbd_gm:+.1f} | curv {rbd_cv:+.1f} | regime {rbd_rg:+.1f}")
         print("")
