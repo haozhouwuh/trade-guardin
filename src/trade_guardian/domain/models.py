@@ -1,47 +1,59 @@
 from __future__ import annotations
-
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import List, Optional, Dict, Any
 
+# --- 基础设施类 (用于 SchwabClient 等) ---
 
 @dataclass
 class HVInfo:
-    status: str = "Error"
+    """Historical Volatility Data Container"""
     current_hv: float = 0.0
     hv_rank: float = 0.0
+    hv_percentile: float = 0.0
+    high_52w: float = 0.0
+    low_52w: float = 0.0
+    # [Fix] 补全 SchwabClient 需要的状态字段
+    status: str = "Success"
+    msg: str = ""
+    # [Optional] 如果还需要其他统计字段，可以在此保留
     hv_low: float = 0.0
     hv_high: float = 0.0
     p50: float = 0.0
     p75: float = 0.0
     p90: float = 0.0
-    msg: str = ""
-
 
 @dataclass
 class TermPoint:
-    exp: str
-    dte: int
-    strike: float
-    mark: float
-    iv: float
+    """Term Structure Point (用于 term structure 计算)"""
+    exp: str = "" # [Fix] 确保有默认值，对应 date_iso
+    exp_date: str = "" # 兼容旧代码
+    dte: int = 0
+    iv: float = 0.0
+    strike: float = 0.0
+    mark: float = 0.0
     delta: float = 0.0
     theta: float = 0.0
     gamma: float = 0.0
 
+# --- 核心分析类 ---
 
 @dataclass
-class TSFeatures:
-    status: str
-    msg: str = ""
-    regime: str = "FLAT"          # CONTANGO / BACKWARDATION / FLAT
-    curvature: str = "NORMAL"     # SPIKY_FRONT / NORMAL
-    short_exp: str = ""
-    short_dte: int = 0
-    short_iv: float = 0.0
-    base_iv: float = 0.0
-    edge: float = 0.0            # short/base ratio
-    squeeze_ratio: float = 0.0   # rank0/base ratio (front spike measure)
+class IVData:
+    rank: float = 0.0
+    percentile: float = 0.0
+    current_iv: float = 0.0
+    hv_rank: float = 0.0
+    current_hv: float = 0.0
 
+@dataclass
+class Context:
+    symbol: str
+    price: float
+    iv: IVData
+    hv: IVData
+    tsf: dict  # Term Structure Factors
+    raw_chain: dict
+    metrics: Any = None # Optional for Greeks
 
 @dataclass
 class ScoreBreakdown:
@@ -52,80 +64,64 @@ class ScoreBreakdown:
     curvature: int = 0
     penalties: int = 0
 
-
 @dataclass
 class RiskBreakdown:
-    """
-    Explainable risk decomposition for the chosen short leg.
-
-    Convention: each component is an integer "risk points".
-    Total risk = base + dte + gamma + curvature + regime + penalties
-    (Future slots: liquidity/event can be added without breaking interfaces.)
-    """
     base: int = 0
     dte: int = 0
     gamma: int = 0
-    curvature: int = 0
     regime: int = 0
+    curvature: int = 0
     penalties: int = 0
-
-
-@dataclass
-class Recommendation:
-    rec_rank: int
-    rec_exp: str
-    rec_dte: int
-    rec_iv: float
-    rec_edge: float
-    rec_score: int
-    rec_risk: int
-    rec_tag: str
-    rec_breakdown: ScoreBreakdown
-    # ✅ default keeps backward compatibility for older recommend() code
-    rec_risk_breakdown: RiskBreakdown = field(default_factory=RiskBreakdown)
-
 
 @dataclass
 class ScanRow:
     symbol: str
     price: float
-
-    # short leg chosen by policy (base rank)
     short_exp: str
     short_dte: int
     short_iv: float
-
-    # baseline (30-90)
     base_iv: float
     edge: float
-
     hv_rank: float
-
     regime: str
     curvature: str
     tag: str
-
     cal_score: int
     short_risk: int
     score_breakdown: ScoreBreakdown
-
-    # ✅ default keeps backward compatibility for existing strategy.evaluate()
-    risk_breakdown: RiskBreakdown = field(default_factory=RiskBreakdown)
-
-    rec: Optional[Recommendation] = None
-    probe_summary: str = ""
-    
-    # [新增] 存放生成的交易蓝图
-    blueprint: Any = None # 实际上是 Optional[CalendarBlueprint]
-
+    risk_breakdown: RiskBreakdown
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
-class Context:
+class Recommendation:
+    strategy: str
     symbol: str
-    price: float
-    vix: float
-    term: List[TermPoint]
-    hv: HVInfo
-    tsf: Dict[str, Any]
-    # [新增] 保留原始 Chain 数据，供 Blueprint 查找报价
-    raw_chain: Dict[str, Any] = field(default_factory=dict)
+    action: str
+    rationale: str
+    entry_price: float
+    score: int
+    conviction: str
+    meta: dict
+
+# --- 执行蓝图类 (Orchestrator 需要) ---
+
+@dataclass
+class OrderLeg:
+    """定义期权策略的一条腿"""
+    symbol: str
+    action: str      # BUY / SELL
+    ratio: int       # e.g. 1
+    exp: str         # Expiry Date (YYYY-MM-DD)
+    strike: float
+    type: str        # CALL / PUT
+
+@dataclass
+class Blueprint:
+    """定义最终生成的执行蓝图"""
+    symbol: str
+    strategy: str
+    legs: List[OrderLeg] = field(default_factory=list)
+    est_debit: float = 0.0
+    note: str = ""
+    gamma_exposure: float = 0.0
+    error: Optional[str] = None

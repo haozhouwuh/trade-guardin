@@ -32,81 +32,90 @@ class LongGammaStrategy(Strategy):
         tsf = ctx.tsf
         regime = str(tsf["regime"])
         curvature = str(tsf["curvature"])
-        # 在 Long Gamma 中，short_exp 指的是我们要买入的那个 Expiry (Active Expiry)
-        # 为了兼容 ScanRow 数据结构，我们暂时借用 short_字段
+        
         target_exp = str(tsf["short_exp"])
         target_dte = int(tsf["short_dte"])
         target_iv = float(tsf["short_iv"])
         hv_rank = float(ctx.hv.hv_rank)
-        
-        # Edge 定义反转：我们希望 HV > IV (市场低估波动)
-        # Edge = HV / IV. 如果 > 1.0 说明做多波动率有利
+        price = float(ctx.price)
         current_hv = float(ctx.hv.current_hv)
-        edge = (current_hv / target_iv) if target_iv > 0 else 0.0
+
+        # [Edge Calculation]
+        # Long Gamma 获利前提是 HV (实际波动) > IV (隐含波动)
+        # 结果为正数表示“IV被低估”，值得买入
+        if target_iv > 0:
+            raw_edge = (current_hv - target_iv) / target_iv
+        else:
+            raw_edge = 0.0
 
         # --- Scoring (0-100) ---
         bd = ScoreBreakdown(base=50)
 
-        # 1. HV Rank (越低越好，买点便宜)
-        if hv_rank <= 20:
-            bd.hv = +15
-        elif hv_rank <= 40:
-            bd.hv = +5
-        elif hv_rank >= 80:
-            bd.hv = -15  # 太贵了，不做多
-        elif hv_rank >= 60:
-            bd.hv = -5
+        # 1. HV Rank (越低越好)
+        if hv_rank <= 20: bd.hv = +15
+        elif hv_rank <= 40: bd.hv = +5
+        elif hv_rank >= 80: bd.hv = -20 
+        elif hv_rank >= 60: bd.hv = -10
 
-        # 2. Regime (喜欢 Contango，因为近月比远月便宜)
-        if regime == "CONTANGO":
-            bd.regime = +5
-        elif regime == "BACKWARDATION":
-            bd.regime = -10 # 倒挂说明近月已经被炒高了，贵
+        # 2. Regime
+        if regime == "CONTANGO": bd.regime = +5
+        elif regime == "BACKWARDATION": bd.regime = -15 
         
-        # 3. Edge (HV vs IV)
-        if edge > 1.1:
-            bd.edge = +10
-        elif edge < 0.9:
-            bd.edge = -5
+        # 3. Edge
+        if raw_edge > 0.1: bd.edge = +10
+        elif raw_edge < -0.1: bd.edge = -10
 
         score = bd.base + bd.regime + bd.edge + bd.hv + bd.curvature + bd.penalties
         
-        # --- Risk (0-100) ---
-        # Long Gamma 的主要风险是 Theta (时间流逝) 和 IV Crush (买贵了)
+        # --- Risk (Gamma Integrated) ---
         rbd = RiskBreakdown(base=20)
 
-        # 1. Theta Risk (DTE 越短，Theta 损耗越快)
-        # < 10天风险极高， 10-20 高， >30 适中
-        if target_dte < 7:
-            rbd.dte = +30
-        elif target_dte < 14:
-            rbd.dte = +20
-        elif target_dte < 21:
-            rbd.dte = +10
+        # 1. Theta Risk
+        if target_dte < 7: rbd.dte = +30
+        elif target_dte < 14: rbd.dte = +20
+        elif target_dte < 21: rbd.dte = +10
         
-        # 2. Valuation Risk (买在高点)
-        if hv_rank > 50:
-            rbd.gamma = +int((hv_rank - 50) / 2) # IV Rank 越高，Risk 越高
+        # 2. Gamma Risk 计算
+        est_gamma = 0.0
+        try:
+            # [Fix] IV 单位标准化：如果 IV > 2.0 (比如 112.0)，说明是百分数，需要除以 100 转小数
+            vol_decimal = target_iv / 100.0 if target_iv > 2.0 else target_iv
+            
+            # DTE 转化为年
+            dte_years = max(1, target_dte) / 365.0
+            
+            if price > 0 and vol_decimal > 0:
+                # Straddle Gamma ≈ 0.8 / (S * σ * √T)
+                # 0.8 是经验系数 (单腿 ATM Gamma * 2)
+                est_gamma = 0.8 / (price * vol_decimal * (dte_years ** 0.5))
+        except Exception:
+            est_gamma = 0.0
 
-        # 3. Regime Risk (Backwardation 意味着高成本)
-        if regime == "BACKWARDATION":
-            rbd.regime = +10
+        # Risk Mapping
+        # Gamma 越高，意味着 Theta 损耗越剧烈，风险越高
+        if est_gamma > 0.15: rbd.gamma = +35 
+        elif est_gamma > 0.08: rbd.gamma = +20
+        elif est_gamma > 0.04: rbd.gamma = +10
+
+        # 3. Regime Risk
+        if regime == "BACKWARDATION": rbd.regime = +10
+        
+        # 4. Valuation Risk (High Rank = Mean Reversion Risk)
+        if hv_rank > 60: rbd.regime += 10
 
         risk = rbd.base + rbd.dte + rbd.gamma + rbd.regime
 
-        # Tag 生成
-        tag = "LG" # Long Gamma
+        tag = "LG" 
         if regime == "CONTANGO": tag += "-C"
-        if regime == "BACKWARDATION": tag += "-B"
-
-        return ScanRow(
+        
+        row = ScanRow(
             symbol=ctx.symbol,
-            price=float(ctx.price),
-            short_exp=target_exp, # 借用字段
+            price=price,
+            short_exp=target_exp, 
             short_dte=target_dte,
             short_iv=target_iv,
             base_iv=float(tsf["base_iv"]),
-            edge=edge, # 注意：这里的 Edge 是 HV/IV
+            edge=float(f"{raw_edge:.2f}"), 
             hv_rank=hv_rank,
             regime=regime,
             curvature=curvature,
@@ -116,8 +125,16 @@ class LongGammaStrategy(Strategy):
             score_breakdown=bd,
             risk_breakdown=rbd,
         )
+        
+        # 注入 Meta 数据，供 Orchestrator 使用
+        row.meta = {
+            "strategy": "long_gamma",
+            "est_gamma": float(f"{est_gamma:.4f}"),
+            "raw_edge": raw_edge
+        }
+
+        return row
 
     def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
-        # 简单起见，暂不支持 Auto-Adjust (需要遍历不同 DTE)
-        # 未来可以实现：如果当前 DTE 风险太高，自动向后找 DTE > 30 的
+        # 暂不支持 Recommendation 直接输出，主要用于 Scanlist
         return None, "-"

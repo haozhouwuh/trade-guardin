@@ -1,248 +1,239 @@
 from __future__ import annotations
+import traceback
+from typing import List, Tuple, Optional, Any
 
-import os
-from typing import List, Tuple, Dict
+from trade_guardian.domain.models import Context, ScanRow, Blueprint, OrderLeg
 
-from trade_guardian.infra.rate_limit import RateLimiter
-from trade_guardian.infra.tickers import load_tickers_csv
-from trade_guardian.infra.cache import JsonDailyCache
-from trade_guardian.infra.schwab_client import SchwabClient
-
-from trade_guardian.domain.models import Context, ScanRow
-from trade_guardian.domain.policy import ShortLegPolicy
-from trade_guardian.domain.features import TSFeatureBuilder
-from trade_guardian.domain.hv import HVService
-
-from trade_guardian.app.renderer import ScanlistRenderer
-from trade_guardian.strategies.base import Strategy
-
-from trade_guardian.strategies.blueprint import (
-    build_calendar_blueprint, 
-    build_straddle_blueprint,
-    build_diagonal_blueprint # <--- 新增
-)
+# 尝试导入策略类
+try:
+    from trade_guardian.strategies.long_gamma import LongGammaStrategy
+    from trade_guardian.strategies.diagonal import DiagonalStrategy
+except ImportError:
+    pass
 
 class TradeGuardian:
     """
-    Orchestrates:
-      - load universe (tickers.csv)
-      - fetch market/option data via SchwabClient
-      - compute HV + term structure features
-      - run strategy scoring + risk
-      - render results
+    Trade Guardian 主控程序
+    负责协调 Data Client, Strategy Scanner 和 Blueprint Generation
     """
-
-    def __init__(self, client: SchwabClient, cfg: dict, policy: ShortLegPolicy, strategy: Strategy):
+    
+    def __init__(self, client, cfg: dict, policy, strategy=None):
         self.client = client
         self.cfg = cfg
         self.policy = policy
-        self.strategy = strategy
+        self.strategy = strategy 
 
-        cache_dir = cfg["paths"]["cache_dir"]
-        os.makedirs(cache_dir, exist_ok=True)
-        hv_cache_path = os.path.join(cache_dir, "hv_cache.json")
-
-        self.hv_cache = JsonDailyCache(hv_cache_path)
-        self.hv_service = HVService(client, self.hv_cache)
-
-        self.tsf_builder = TSFeatureBuilder(cfg, policy)
-        self.limiter = RateLimiter(cfg["scan"]["throttle_sec"])
-
-        self.renderer = ScanlistRenderer(cfg, policy, hv_cache_path=hv_cache_path)
-
-    def _build_context(self, symbol: str, days: int, base_rank: int) -> Context:
-        vix = self.client.get_market_vix()
-        hv = self.hv_service.get_hv(symbol)
-
-        # [修改] 接收 raw_chain
-        price, term, raw_chain = self.client.scan_atm_term(
-            symbol,
-            days,
-            contract_type=self.cfg["scan"]["contract_type"],
-        )
-        tsf = self.tsf_builder.build(term, hv, rank=base_rank)
-
-        if tsf.get("status") != "Success":
-            raise RuntimeError(tsf.get("msg", "TSF error"))
-
-        # [修改] 传入 raw_chain
-        return Context(symbol=symbol, price=price, vix=vix, term=term, hv=hv, tsf=tsf, raw_chain=raw_chain)
-    
-
-    def scanlist(self, days: int, min_score: int, max_risk: int, limit: int = 0, detail: bool = False):
+    def scanlist(self, strategy_name: str = "auto", days: int = 600, 
+                 min_score: int = 60, max_risk: int = 70, detail: bool = False,
+                 limit: int = None, **kwargs):
         """
-        Strict rule (MUST be enforced exactly):
-            cal_score >= min_score AND short_risk <= max_risk
-        Watch:
-            cal_score >= min_score AND short_risk > max_risk
+        CLI 命令: 扫描列表并生成交易蓝图
         """
-        csv_path = self.cfg["paths"]["tickers_csv"]
-        tickers = load_tickers_csv(csv_path)
+        print("=" * 95)
+        print(f"🧠 TRADE GUARDIAN :: SCANLIST (days={days})")
+        print("=" * 95)
+
+        # 1. 获取观察列表
+        tickers = self._get_universe()
+        
         if limit and limit > 0:
             tickers = tickers[:limit]
 
-        base_rank = int(self.policy.base_rank)
+        print(f"Universe size: {len(tickers)} | Strategy: {strategy_name.upper()}")
+        print(f"Strict Filter: score >= {min_score}, short_risk <= {max_risk}")
+        print("-" * 95)
+        
+        headers = f"{'Sym':<6} {'Px':<8} {'ShortExp':<12} {'DTE':<4} {'ShortIV':<8} {'BaseIV':<8} {'Edge':<8} {'HV%':<6} {'Score':<6} {'Risk':<4} {'Tag'}"
+        print(headers)
+        print("-" * 95)
 
-        rows_ctx: List[Tuple[ScanRow, Context]] = []
-        errors: List[Tuple[str, str]] = []
-
-        for sym in tickers:
+        strict_results: List[Tuple[ScanRow, Context]] = []
+        
+        # 2. 扫描循环
+        for ticker in tickers:
             try:
-                ctx = self._build_context(sym, days, base_rank)
-                row = self.strategy.evaluate(ctx)  # type: ignore
-                rows_ctx.append((row, ctx))
+                # 构建上下文
+                ctx = self.client.build_context(ticker, days=days)
+                if not ctx: 
+                    # print(f"Skipping {ticker}: No Context built")
+                    continue
+
+                # 确定策略
+                strategies_to_run = []
+                
+                if self.strategy:
+                    strategies_to_run = [self.strategy]
+                elif strategy_name == "auto":
+                    strategies_to_run = [
+                        self._load_strategy("long_gamma"),
+                        self._load_strategy("diagonal")
+                    ]
+                else:
+                    strategies_to_run = [self._load_strategy(strategy_name)]
+
+                strategies_to_run = [s for s in strategies_to_run if s is not None]
+
+                if not strategies_to_run:
+                    continue
+
+                best_row = None
+                
+                for strategy in strategies_to_run:
+                    row = strategy.evaluate(ctx)
+                    
+                    if not best_row or row.cal_score > best_row.cal_score:
+                        best_row = row
+
+                if best_row:
+                    self._print_row(best_row, min_score, max_risk)
+                    
+                    if best_row.cal_score >= min_score and best_row.short_risk <= max_risk:
+                        strict_results.append((best_row, ctx))
+                
             except Exception as e:
-                errors.append((sym, str(e)))
-            finally:
-                self.limiter.sleep()
-
-        rows: List[ScanRow] = [rc[0] for rc in rows_ctx]
-        ctx_map: Dict[str, Context] = {rc[0].symbol: rc[1] for rc in rows_ctx}
-
-        # ------------------------------------------------------------------
-        # STRICT/WATCH FILTERS (IMPORTANT: strict must use <= max_risk exactly)
-        # ------------------------------------------------------------------
-        strict: List[ScanRow] = [
-            r for r in rows
-            if (r.cal_score >= min_score) and (r.short_risk <= max_risk)
-        ]
-
-        watch_candidates: List[ScanRow] = [
-            r for r in rows
-            if (r.cal_score >= min_score) and (r.short_risk > max_risk)
-        ]
-
-        auto_adjusted: List[ScanRow] = []
-        still_watch: List[ScanRow] = []
-
-        # Try auto-adjust within probe ranks only for the watch candidates
-        for r in watch_candidates:
-            ctx = ctx_map.get(r.symbol)
-            if not ctx:
-                still_watch.append(r)
+                print(f"❌ Error scanning {ticker}: {e}")
+                # traceback.print_exc()
                 continue
 
-            rec, summary = self.strategy.recommend(ctx, min_score=min_score, max_risk=max_risk)  # type: ignore
-            if rec:
-                r.rec = rec
-                r.probe_summary = summary
-                auto_adjusted.append(r)
-            else:
-                r.probe_summary = summary
-                still_watch.append(r)
-
-        # sorting helpers
-        def _sort_key_score(r: ScanRow):
-            return (r.cal_score, r.edge, -r.short_risk)
-
-        def _sort_key_rec(r: ScanRow):
-            if not r.rec:
-                return (0, 0.0, -100)
-            return (r.rec.rec_score, r.rec.rec_edge, -(r.rec.rec_risk))
-
-        strict.sort(key=_sort_key_score, reverse=True)
-        auto_adjusted.sort(key=_sort_key_rec, reverse=True)
-        still_watch.sort(key=_sort_key_score, reverse=True)
-        top = sorted(rows, key=_sort_key_score, reverse=True)
-
-        # ------------------------------------------------------------------
-        # GENERATE BLUEPRINTS (Strategy #3 Implementation)
-        # ------------------------------------------------------------------
-        
-        # 1. 定义内部函数
-        def _attach_blueprint(row: ScanRow):
-            ctx = ctx_map.get(row.symbol)
-            if not ctx: return
-
-            # === 分支 A: Diagonal / PMCC (New!) ===
-            # 检查 meta 里的标记
-            meta = getattr(row, "meta", {}) or {}
-            if meta.get("strategy") == "diagonal":
-                bp = build_diagonal_blueprint(
-                    symbol=row.symbol,
-                    underlying=row.price,
-                    chain=ctx.raw_chain,
-                    short_exp=row.short_exp,
-                    long_exp=meta["long_exp"],
-                    target_short_strike=meta["short_strike"],
-                    target_long_strike=meta["long_strike"],
-                    side="CALL" # PMCC 默认做 Call
-                )
-                row.blueprint = bp
-                return
-
-            # === 分支 B: Long Gamma / Straddle ===
-            is_long_gamma = (self.strategy.name == "long_gamma") or ("LG" in row.tag)
-            if is_long_gamma:
-                # 这里的 row.short_exp 其实是 active expiry
-                bp = build_straddle_blueprint(
-                    symbol=row.symbol,
-                    underlying=row.price,
-                    chain=ctx.raw_chain,
-                    exp=row.short_exp 
-                )
-                row.blueprint = bp
-                return
+        # 5. 打印 Actionable Blueprints
+        if detail and strict_results:
+            print("\n🚀 Actionable Blueprints (Execution Plan)")
+            print("-" * 95)
             
-
-            # === 分支 C: Calendar / Default ===
-            # ... (原有的 Calendar 逻辑保持不变)
-            short_idx = -1
-            for i, p in enumerate(ctx.term):
-                if p.exp == row.short_exp:
-                    short_idx = i
-                    break
-            
-            # 调试打印
-            #print(f"DEBUG: {row.symbol} short_exp={row.short_exp} short_idx={short_idx} total_term_len={len(ctx.term)}", flush=True)
-
-            if short_idx != -1 and short_idx + 1 < len(ctx.term):
-                long_point = ctx.term[short_idx + 1]
-                
-                bp = build_calendar_blueprint(
-                    symbol=row.symbol,
-                    underlying=row.price,
-                    chain=ctx.raw_chain,
-                    short_exp=row.short_exp,
-                    long_exp=long_point.exp,
-                    prefer_side="CALL"
-                )
+            for row, ctx in strict_results:
+                bp = self.plan(ctx, row)
                 if bp:
-                    row.blueprint = bp
-                #else:
-                    #print(f"DEBUG: {row.symbol} build_calendar_blueprint returned None", flush=True)
-            #else:
-                #print(f"DEBUG: {row.symbol} No next expiry found (term list too short)", flush=True)
+                    self._print_blueprint(bp)
 
-        # 2. 执行循环 (注意：这里必须和 def _attach_blueprint 对齐，不能在它里面！)
-        #print(f"DEBUG: Starting Blueprint generation for {len(strict)} strict candidates...", flush=True)
+        print("-" * 95)
+        count = max(1, len(strict_results))
+        avg_score = sum(r[0].cal_score for r in strict_results) / count
+        avg_edge = sum(r[0].edge for r in strict_results) / count
+        print(f"🧾 Diagnostics\n   • Avg Score: {avg_score:.1f} | Avg Edge: {avg_edge:.2f}x")
+
+    # --- Blueprint Logic ---
+
+    def plan(self, ctx: Context, row: ScanRow) -> Optional[Blueprint]:
+        strategy_type = row.meta.get("strategy", "").lower()
         
-        for r in strict:
-            _attach_blueprint(r)
+        if strategy_type == "diagonal":
+            return self._plan_diagonal(ctx, row)
             
-        for r in top[:3]: 
-            if r.blueprint is None: # 避免重复计算
-                _attach_blueprint(r)
+        if strategy_type == "long_gamma" or "LG" in row.tag:
+            return self._plan_straddle(ctx, row)
+            
+        return None
 
-        # Renderer is responsible for printing thresholds consistently.
-        self.renderer.render(
-            days=days,
-            universe_size=len(rows),
-            min_score=min_score,
-            max_risk=max_risk,
-            strict=strict,
-            auto_adjusted=auto_adjusted,
-            watch=still_watch,
-            top=top,
-            errors=errors,
-            detail=detail,
+    def _plan_diagonal(self, ctx: Context, row: ScanRow) -> Optional[Blueprint]:
+        short_strike = row.meta.get("short_strike")
+        long_strike = row.meta.get("long_strike")
+        long_exp = row.meta.get("long_exp")
+        spread_width = row.meta.get("spread_width", 0.0)
+        
+        if not (short_strike and long_strike and long_exp):
+            return None
+
+        est_debit = max(0.0, row.price - long_strike) + (spread_width * 0.15)
+        
+        safety_note = ""
+        max_loss = spread_width - est_debit
+        if max_loss < 0:
+            safety_note = " ⚠️ WARNING: Est Debit > Width (Locked Loss Risk!)"
+
+        legs = [
+            OrderLeg(symbol=ctx.symbol, action="BUY", ratio=1, exp=long_exp, strike=long_strike, type="CALL"),
+            OrderLeg(symbol=ctx.symbol, action="SELL", ratio=1, exp=row.short_exp, strike=short_strike, type="CALL")
+        ]
+        
+        rationale = (
+            f"PMCC Setup: Buy LEAPS / Sell Near-Term Call.\n"
+            f"   • Spread Width: ${spread_width:.2f}\n"
+            f"   • Est Debit:    ${est_debit:.2f} (Target < {spread_width:.2f})\n"
+            f"   • Edge:         {row.edge:.2f} (Short IV > Long IV){safety_note}"
         )
 
-        self.renderer.render_diagnostics(
-            rows=rows,
-            min_score=min_score,
-            max_risk=max_risk,
-            strict=strict,
-            auto_adjusted=auto_adjusted,
-            detail=detail,
+        return Blueprint(symbol=ctx.symbol, strategy="DIAGONAL", legs=legs, est_debit=est_debit, note=rationale)
+
+    def _plan_straddle(self, ctx: Context, row: ScanRow) -> Optional[Blueprint]:
+        est_gamma = row.meta.get("est_gamma", 0.0)
+        target_exp = row.short_exp
+        
+        atm_strike = round(row.price, 1)
+
+        dte_years = max(1, row.short_dte) / 365.0
+        vol_decimal = row.short_iv / 100.0 if row.short_iv > 2.0 else row.short_iv
+        est_debit = 0.8 * row.price * vol_decimal * (dte_years ** 0.5)
+
+        legs = [
+            OrderLeg(symbol=ctx.symbol, action="BUY", ratio=1, exp=target_exp, strike=atm_strike, type="CALL"),
+            OrderLeg(symbol=ctx.symbol, action="BUY", ratio=1, exp=target_exp, strike=atm_strike, type="PUT")
+        ]
+
+        risk_alert = ""
+        if est_gamma > 0.15:
+            risk_alert = f" ⚠️ HIGH GAMMA RISK ({est_gamma:.4f})"
+
+        note = (
+            f"Long Gamma Play: Buy ATM Straddle.\n"
+            f"   • Est Gamma:      {est_gamma:.4f}{risk_alert}\n"
+            f"   • Breakeven move: ±${est_debit:.2f}"
         )
+
+        return Blueprint(
+            symbol=ctx.symbol, 
+            strategy="STRADDLE", 
+            legs=legs, 
+            est_debit=est_debit, 
+            note=note, 
+            gamma_exposure=est_gamma
+        )
+
+    # --- Helpers ---
+
+    def _get_universe(self) -> List[str]:
+        return [
+            "AMD", "NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOGL",
+            "SPY", "QQQ", "IWM", "TQQQ", "SQQQ", "SOXL", "TSLL",
+            "COIN", "MSTR", "ONDS", "SMCI", "BABA", "LLY"
+        ]
+
+    def _load_strategy(self, name: str):
+        if name == "long_gamma":
+            return LongGammaStrategy(self.cfg, self.policy)
+        elif name == "diagonal":
+            return DiagonalStrategy(self.cfg, self.policy)
+        return None
+
+    def _print_row(self, row: ScanRow, min_score: int, max_risk: int):
+        edge_str = f"{row.edge:+.2f}x"
+        
+        risk_str = f"{row.short_risk}"
+        if row.short_risk > max_risk:
+            risk_str = f"!{row.short_risk}!" 
+        
+        # 修复百分比格式显示，移除多余空格
+        s_iv_str = f"{row.short_iv:.1f}%"
+        b_iv_str = f"{row.base_iv:.1f}%"
+        hv_str = f"{row.hv_rank:.0f}%"
+
+        print(f"{row.symbol:<6} {row.price:<8.2f} {row.short_exp:<12} {row.short_dte:<4} "
+              f"{s_iv_str:<8} {b_iv_str:<8} {edge_str:<8} "
+              f"{hv_str:<6} {row.cal_score:<6} {risk_str:<4} {row.tag}")
+    
+    def _print_blueprint(self, bp: Blueprint):
+        print(f" {bp.symbol} {bp.strategy:<10} Est.Debit: ${bp.est_debit:.2f}")
+        
+        # [Critical Fix] 显式打印每一条腿 (Actionable Details)
+        if bp.legs:
+            for leg in bp.legs:
+                action_sign = "+" if leg.action == "BUY" else "-"
+                # 格式: +1 2026-01-16 202.5 CALL
+                print(f"    {action_sign}{leg.ratio} {leg.exp} {leg.strike:<6} {leg.type}")
+        
+        print(f"    {'='*30}") # 分隔线
+        
+        # 打印 Note
+        lines = bp.note.split('\n')
+        for line in lines:
+            print(f"    {line}")
+        print("")
