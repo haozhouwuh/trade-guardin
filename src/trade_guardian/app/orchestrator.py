@@ -3,11 +3,13 @@ import os
 import sys
 import pandas as pd
 import traceback
+import time
 from typing import List, Tuple, Optional, Any
+from colorama import Fore, Style
 
 from trade_guardian.domain.models import Context, ScanRow, Blueprint, OrderLeg
+from trade_guardian.app.persistence import PersistenceManager
 
-# 策略类导入
 try:
     from trade_guardian.strategies.long_gamma import LongGammaStrategy
     from trade_guardian.strategies.diagonal import DiagonalStrategy
@@ -15,41 +17,26 @@ except ImportError:
     pass
 
 class TradeGuardian:
-    """
-    Trade Guardian 主控程序
-    严格执行: 从 CSV 读取名单，执行硬风控计划。
-    """
-    
     def __init__(self, client, cfg: dict, policy, strategy=None):
         self.client = client
         self.cfg = cfg
         self.policy = policy
         self.strategy = strategy 
-        # 强制指定配置文件路径
         self.tickers_path = os.path.join("data", "tickers.csv")
+        self.db = PersistenceManager()
+        self.last_batch_df: Optional[pd.DataFrame] = None 
 
     def _get_universe(self) -> List[str]:
-        """
-        [Strict Logic] 从 data/tickers.csv 读取名单。
-        如果文件不存在，直接报错并退出程序。
-        """
         if not os.path.exists(self.tickers_path):
             print(f"\n❌ [CRITICAL ERROR] Tickers file NOT FOUND at: {os.path.abspath(self.tickers_path)}")
-            print("程序无法继续执行，请检查 data 目录。")
-            sys.exit(1) # 强制退出
-
+            sys.exit(1)
         try:
-            # 读取 CSV，处理没有表头的情况
             df = pd.read_csv(self.tickers_path, header=None)
-            # 取第一列，转为大写字符串，去除空值
             tickers = df[0].dropna().apply(lambda x: str(x).strip().upper()).tolist()
-            # 过滤掉可能的重复项
             unique_tickers = []
             for t in tickers:
-                if t and t not in unique_tickers:
-                    unique_tickers.append(t)
+                if t and t not in unique_tickers: unique_tickers.append(t)
             return unique_tickers
-            
         except Exception as e:
             print(f"❌ [CRITICAL ERROR] Failed to parse {self.tickers_path}: {e}")
             sys.exit(1)
@@ -58,102 +45,137 @@ class TradeGuardian:
                  min_score: int = 60, max_risk: int = 70, detail: bool = False,
                  limit: int = None, top: int = None, **kwargs):
         
-        print("=" * 105)
-        print(f"🧠 TRADE GUARDIAN :: SCANLIST (days={days})")
-        print("=" * 105)
+        try:
+            vix_q = self.client.get_quote("$VIX")
+            current_vix = vix_q.get("lastPrice", 0.0)
+        except:
+            current_vix = 0.0
+        
+        print("=" * 115)
+        print(f"🧠 TRADE GUARDIAN :: SCANLIST (days={days}) | VIX: {current_vix:.2f}")
+        print("=" * 115)
 
-        # 1. 获取名单 (来自 CSV)
         tickers = self._get_universe()
-        
-        if limit and limit > 0: 
-            tickers = tickers[:limit]
+        if limit and limit > 0: tickers = tickers[:limit]
 
-        print(f"Universe Source: {self.tickers_path} ({len(tickers)} tickers)")
-        print(f"Strict Filter:   score >= {min_score}, short_risk <= {max_risk}")
-        if top: print(f"Top Focus:       Best {top} candidates (Gate > Edge > Risk)")
-        print("-" * 105)
-        
-        # 表头对齐补丁已就位
-        headers = f"{'Sym':<6} {'Px':<8} {'ShortExp':<12} {'DTE':<4} {'ShortIV':<8} {'BaseIV':<8} {'Edge':<8} {'HV%':<6} {'Score':<6} {'Risk':<4} {'Gate':<4} {'Tag'}"
+        headers = f"{'Sym':<6} {'Px':<8} {'ShortExp':<12} {'DTE':<4} {'ShortIV':<8} {'BaseIV':<8} {'Edge':<8} {'HV%':<6} {'Score':<6} {'Risk':<5} {'Gate':<8} {'Tag'}"
         print(headers)
-        print("-" * 105)
+        print("-" * 115)
 
         strict_results: List[Tuple[ScanRow, Context, Optional[Blueprint], str]] = []
+        current_rows = []
         
-        # 2. 扫描循环
         for ticker in tickers:
             try:
                 ctx = self.client.build_context(ticker, days=days)
                 if not ctx: continue
-
+                
                 strategies_to_run = []
-                if self.strategy: 
-                    strategies_to_run = [self.strategy]
+                if self.strategy: strategies_to_run = [self.strategy]
                 elif strategy_name == "auto":
                     strategies_to_run = [self._load_strategy("long_gamma"), self._load_strategy("diagonal")]
-                else: 
-                    strategies_to_run = [self._load_strategy(strategy_name)]
-
-                strategies_to_run = [s for s in strategies_to_run if s is not None]
-                if not strategies_to_run: continue
+                else: strategies_to_run = [self._load_strategy(strategy_name)]
 
                 best_row = None
-                for strategy in strategies_to_run:
+                for strategy in [s for s in strategies_to_run if s is not None]:
                     row = strategy.evaluate(ctx)
-                    if not best_row or row.cal_score > best_row.cal_score:
-                        best_row = row
+                    if not best_row or row.cal_score > best_row.cal_score: best_row = row
 
                 if best_row:
                     bp = self.plan(ctx, best_row)
-                    gate_status = self._get_gate_status(bp)
-                    
-                    # 打印扫描行
+                    gate_status = self._get_gate_status(best_row, bp) 
                     self._print_row(best_row, min_score, max_risk, gate_status)
+                    current_rows.append({'symbol': best_row.symbol, 'price': best_row.price, 'iv': best_row.short_iv})
                     
-                    # 只有符合过滤条件的才进入候选结果
-                    if best_row.cal_score >= min_score and best_row.short_risk <= max_risk:
+                    if gate_status != "FORBID" and best_row.cal_score >= min_score and best_row.short_risk <= max_risk:
                         strict_results.append((best_row, ctx, bp, gate_status))
-                
-            except Exception as e:
-                # 扫描单个出错不退出，继续下一个
-                print(f"❌ Error scanning {ticker}: {e}")
+            except Exception:
                 continue
 
-        # 3. 蓝图排序与输出 (Top N)
-        def sort_key(item):
-            row, _, _, gate = item
-            gate_clean = gate.strip()
-            gate_prio = 3
-            if gate_clean == "✅": gate_prio = 0
-            elif gate_clean == "⚠️": gate_prio = 1
-            elif gate_clean == "⛔": gate_prio = 2
-            return (gate_prio, -row.edge, row.short_risk, -row.cal_score)
-
-        strict_results.sort(key=sort_key)
+        current_batch_df = pd.DataFrame(current_rows)
+        if self.last_batch_df is not None and not current_batch_df.empty:
+            self._check_fomo_alerts(current_batch_df, self.last_batch_df, current_vix)
+        
+        # 排序
+        strict_results.sort(key=lambda x: ({"EXEC": 0, "WARN": 1, "REJECT": 2, "FORBID": 3}.get(x[3], 4), -x[0].edge))
         display_results = strict_results[:top] if top and top > 0 else strict_results
 
         if detail and display_results:
             print("\n🚀 Actionable Blueprints (Execution Plan)")
-            print("-" * 105)
+            print("-" * 115)
             for row, ctx, bp, gate in display_results:
-                if bp: self._print_blueprint(bp)
+                # 即使没有新信号，也要打印蓝图
+                self._print_enhanced_blueprint(bp, row, current_vix)
 
-        # 4. 统计诊断
-        print("-" * 105)
+        # 更新历史数据用于下一轮对比
+        self.last_batch_df = current_batch_df
+
+        print("-" * 115)
         count = max(1, len(strict_results))
-        avg_abs_edge = sum(abs(r[0].edge) for r in strict_results) / count
-        pos_edge_count = sum(1 for r in strict_results if r[0].edge > 0)
-        pos_edge_pct = (pos_edge_count / count) * 100
-        avg_score = sum(r[0].cal_score for r in strict_results) / count
-        
-        print(f"🧾 Diagnostics (Universe)")
-        print(f"   • Avg Score:     {avg_score:.1f}")
-        print(f"   • Avg |Edge|:    {avg_abs_edge:.2f}x (Intensity)")
-        print(f"   • Cheap Vol (%): {pos_edge_pct:.0f}% (Edge > 0)")
-        print(f"\n[ Legend ]")
-        print(f"   ✅ Executable   | ⚠️ High Risk (Review) | ⛔ Rejected (Policy)")
+        self.db.save_scan_session(
+            strategy_name=strategy_name, vix=current_vix, universe_size=len(tickers),
+            avg_edge=sum(abs(r[0].edge) for r in strict_results)/count,
+            cheap_pct=(sum(1 for r in strict_results if r[0].edge > 0)/count)*100,
+            elapsed=kwargs.get("elapsed", 0.0), results=strict_results 
+        )
 
-    # --- Blueprint Logic ---
+    def _get_gate_status(self, row: ScanRow, bp: Optional[Blueprint]) -> str:
+        gamma = row.meta.get("est_gamma", 0.0)
+        if gamma >= 0.20: return "FORBID" 
+        if not bp: return "ERROR" 
+        if bp.error: return "REJECT" 
+        if "HIGH" in bp.note or "EXTREME" in bp.note: return "WARN"
+        return "EXEC"
+
+    def _check_fomo_alerts(self, now_df: pd.DataFrame, prev_df: pd.DataFrame, current_vix: float):
+        comp = pd.merge(now_df, prev_df, on='symbol', suffixes=('_n', '_p'))
+        for _, r in comp.iterrows():
+            px_pct = (r['price_n'] - r['price_p']) / r['price_p']
+            iv_diff_15m = r['iv_n'] - r['iv_p']
+            iv_drift_1h = self.db.get_latest_drift_1h(r['symbol']) 
+
+            if px_pct > 0.005 and iv_diff_15m > 1.0:
+                print(Fore.RED + Style.BRIGHT + f"🚀 [FOMO] {r['symbol']}: Px +{px_pct:.2%} & IV +{iv_diff_15m:+.1f}%" + Style.RESET_ALL)
+            if iv_drift_1h > 2.0 and iv_diff_15m < -0.5:
+                print(Fore.YELLOW + Style.BRIGHT + f"🏹 [SLINGSHOT] {r['symbol']}: 1h Drift {iv_drift_1h:+.1f} | 15m Pullback {iv_diff_15m:+.1f}" + Style.RESET_ALL)
+
+    def _print_enhanced_blueprint(self, bp: Blueprint, row: ScanRow, vix: float):
+        """全面增强版蓝图：实现 DNA 识别与天蓝色(Cyan)视觉优化"""
+        if not bp: return
+        iv_diff_15m = 0.0
+        # 获取 15 分钟 IV 变化用于 DNA 判定
+        if self.last_batch_df is not None:
+            prev_row = self.last_batch_df[self.last_batch_df['symbol'] == bp.symbol]
+            if not prev_row.empty:
+                iv_diff_15m = row.short_iv - prev_row.iloc[0]['iv']
+
+        # 1. 判定 DNA 类型、模板建议与显示颜色
+        if iv_diff_15m > 2.0:
+            dna, temp, color = "PULSE (脉冲🔥)", "寿命 < 30m | 核心指标: Δ15m 转负即撤 | 目标: 捕获瞬时波峰", Fore.CYAN
+        elif iv_diff_15m > 0.5:
+            dna, temp, color = "TREND (趋势🚀)", "寿命 > 60m | 核心指标: 盯紧 VIX 趋势 | 目标: 结构性波动扩张", Fore.GREEN
+        elif iv_diff_15m < -1.0:
+            dna, temp, color = "CRUSH (收缩❄️)", "⚠️ 风险: IV 正在快速萎缩 | 核心指标: 价格若无大动静应避开", Fore.YELLOW
+        else:
+            dna, temp, color = "QUIET (平静⏳)", "寿命: 待定 | 核心指标: 关注盘整区间突破 | 目标: 低成本潜伏", Fore.WHITE
+        
+        # 2. 打印头部与 DNA 标签
+        print(f" {color}{bp.symbol} {bp.strategy:<10} DNA: {dna}{Style.RESET_ALL}")
+        print(f"    Est.Debit: ${bp.est_debit:.2f} | Gamma: {row.meta.get('est_gamma', 0.0):.4f}")
+        
+        # 3. 打印期权腿明细
+        for leg in bp.legs:
+            print(f"    {'+' if leg.action == 'BUY' else '-'}{leg.ratio} {leg.exp} {leg.strike:<6} {leg.type}")
+        
+        # 4. 打印退出模板 (核心升级：使用天蓝色 Cyan 提高可读性)
+        if bp.error:
+            print(f"    {Fore.RED}❌ REJECTED: {bp.error}{Style.RESET_ALL}")
+        else:
+            # 修改此处为 Fore.CYAN + Style.BRIGHT 确保在黑色背景下清晰可见
+            print(f"    {Fore.CYAN}{Style.BRIGHT}📋 EXIT TEMPLATE: {temp}{Style.RESET_ALL}")
+            
+        print(f"    {'='*80}\n")
+        
 
     def plan(self, ctx: Context, row: ScanRow) -> Optional[Blueprint]:
         stype = row.meta.get("strategy", "").lower()
@@ -161,99 +183,32 @@ class TradeGuardian:
         if stype == "long_gamma" or "LG" in row.tag: return self._plan_straddle(ctx, row)
         return None
 
-    def _get_gate_status(self, bp: Optional[Blueprint]) -> str:
-        if not bp: return "❌" 
-        if bp.error: return "⛔" 
-        if "HIGH" in bp.note or "EXTREME" in bp.note:
-             return "⚠️ " # 补空格对齐
-        return "✅"
+    def _plan_straddle(self, ctx: Context, row: ScanRow) -> Optional[Blueprint]:
+        g = row.meta.get("est_gamma", 0.0)
+        atm = round(row.price, 1)
+        iv_dec = row.short_iv / 100.0 if row.short_iv > 2.0 else row.short_iv
+        debit = 0.8 * row.price * iv_dec * ((max(1, row.short_dte)/365.0)**0.5)
+        legs = [OrderLeg(ctx.symbol, "BUY", 1, row.short_exp, atm, "CALL"), 
+                OrderLeg(ctx.symbol, "BUY", 1, row.short_exp, atm, "PUT")]
+        return Blueprint(ctx.symbol, "STRADDLE", legs, debit, f"Gamma={g:.4f}", gamma_exposure=g)
 
     def _plan_diagonal(self, ctx: Context, row: ScanRow) -> Optional[Blueprint]:
-        short_strike = row.meta.get("short_strike")
-        long_strike = row.meta.get("long_strike")
-        long_exp = row.meta.get("long_exp")
-        spread_width = row.meta.get("spread_width", 0.0)
-        
-        if not (short_strike and long_strike and long_exp): return None
-
-        est_debit = max(0.0, row.price - long_strike) + (spread_width * 0.15)
-        
-        error_msg = None
-        if est_debit >= spread_width:
-             excess = est_debit - spread_width
-             error_msg = (f"REJECTED: Debit > Width. Excess: ${excess:.2f}.\n"
-                          f"       -> Try buying deeper ITM LEAPS or RAISING Short Strike.")
-
-        safety_note = ""
-        if est_debit > 0.90 * spread_width and not error_msg: 
-            safety_note = " ⚠️ CAUTION: High Debit/Width Ratio"
-
-        legs = [
-            OrderLeg(symbol=ctx.symbol, action="BUY", ratio=1, exp=long_exp, strike=long_strike, type="CALL"),
-            OrderLeg(symbol=ctx.symbol, action="SELL", ratio=1, exp=row.short_exp, strike=short_strike, type="CALL")
-        ]
-        
-        rationale = (f"PMCC Setup: Buy LEAPS / Sell Near-Term Call.\n"
-                     f"   • Spread Width: ${spread_width:.2f}\n"
-                     f"   • Est Debit:    ${est_debit:.2f} (Target < {spread_width:.2f}){safety_note}")
-
-        if error_msg: rationale = f"Strategy Gate: Blocked by Risk Policy.\n   • {error_msg}"
-
-        return Blueprint(symbol=ctx.symbol, strategy="DIAGONAL", legs=legs, 
-                         est_debit=est_debit, note=rationale, error=error_msg)
-
-    def _plan_straddle(self, ctx: Context, row: ScanRow) -> Optional[Blueprint]:
-        est_gamma = row.meta.get("est_gamma", 0.0)
-        atm_strike = round(row.price, 1)
-        dte_years = max(1, row.short_dte) / 365.0
-        vol_decimal = row.short_iv / 100.0 if row.short_iv > 2.0 else row.short_iv
-        est_debit = 0.8 * row.price * vol_decimal * (dte_years ** 0.5)
-
-        legs = [
-            OrderLeg(symbol=ctx.symbol, action="BUY", ratio=1, exp=row.short_exp, strike=atm_strike, type="CALL"),
-            OrderLeg(symbol=ctx.symbol, action="BUY", ratio=1, exp=row.short_exp, strike=atm_strike, type="PUT")
-        ]
-
-        risk_label = "NORMAL"
-        if est_gamma >= 0.20: risk_label = "EXTREME ⛔"
-        elif est_gamma >= 0.12: risk_label = "HIGH ⚠️  "
-        elif est_gamma >= 0.08: risk_label = "ELEVATED 🔸"
-        
-        risk_alert = f" [{risk_label}]" if est_gamma >= 0.08 else ""
-        note = (f"Long Gamma Play: Buy ATM Straddle.\n"
-                f"   • Est Gamma (Total): {est_gamma:.4f}{risk_alert}\n"
-                f"   • Breakeven move:    ±${est_debit:.2f}")
-
-        return Blueprint(symbol=ctx.symbol, strategy="STRADDLE", legs=legs, 
-                         est_debit=est_debit, note=note, gamma_exposure=est_gamma)
-
-    # --- Helpers ---
+        s_s, l_e, l_s = row.meta.get("short_strike"), row.meta.get("long_exp"), row.meta.get("long_strike")
+        width = row.meta.get("spread_width", 0.0)
+        if not (s_s and l_s and l_e): return None
+        debit = max(0.0, row.price - l_s) + (width * 0.15)
+        err = f"REJECTED: Debit > Width" if debit >= width else None
+        legs = [OrderLeg(ctx.symbol, "BUY", 1, l_e, l_s, "CALL"), 
+                OrderLeg(ctx.symbol, "SELL", 1, row.short_exp, s_s, "CALL")]
+        return Blueprint(ctx.symbol, "DIAGONAL", legs, debit, f"Width=${width:.2f}", error=err)
 
     def _load_strategy(self, name: str):
         if name == "long_gamma": return LongGammaStrategy(self.cfg, self.policy)
         elif name == "diagonal": return DiagonalStrategy(self.cfg, self.policy)
         return None
 
-    def _print_row(self, row: ScanRow, min_score: int, max_risk: int, gate_status: str):
-        risk_str = f"!{row.short_risk}!" if row.short_risk > max_risk else f"{row.short_risk}"
-        s_iv_str, b_iv_str, hv_str = f"{row.short_iv:.1f}%", f"{row.base_iv:.1f}%", f"{row.hv_rank:.0f}%"
-        # 物理空格对齐补丁 (gate_status + 2空格)
+    def _print_row(self, row: ScanRow, min_s: int, max_r: int, gate: str):
+        risk_str = f"!{row.short_risk}!" if row.short_risk > max_r else f"{row.short_risk}"
         print(f"{row.symbol:<6} {row.price:<8.2f} {row.short_exp:<12} {row.short_dte:<4} "
-              f"{s_iv_str:<8} {b_iv_str:<8} {row.edge:+.2f}x   "
-              f"{hv_str:<6} {row.cal_score:<6} {risk_str:<4} {gate_status}  {row.tag}")
-    
-    def _print_blueprint(self, bp: Blueprint):
-        print(f" {bp.symbol} {bp.strategy:<10} Est.Debit: ${bp.est_debit:.2f}")
-        if bp.legs:
-            for leg in bp.legs:
-                action_sign = "+" if leg.action == "BUY" else "-"
-                print(f"    {action_sign}{leg.ratio} {leg.exp} {leg.strike:<6} {leg.type}")
-        print(f"    {'='*30}") 
-        if bp.error:
-            print(f"    ⛔ {bp.error.splitlines()[0]}")
-            lines = bp.note.split('\n')
-            for line in lines:
-                if "Try" in line or "Reason" in line: print(f"    {line}")
-        else:
-            for line in bp.note.split('\n'): print(f"    {line}")
-        print("")
+              f"{row.short_iv:>6.1f}% {row.base_iv:>6.1f}% {row.edge:>7.2f}x    "
+              f"{row.hv_rank:>4.0f}% {row.cal_score:>5} {risk_str:>5} {gate:<8} {row.tag}")
