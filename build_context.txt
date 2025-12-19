@@ -1,0 +1,142 @@
+create_tg_db.py:def init_db():
+history_viewer.py:    def __init__(self, db_path="db/trade_guardian.db"):
+history_viewer.py:    def get_latest_radar(self, symbol=None, limit=20):
+history_viewer.py:    def _process_logic(self, df, latest_id, conn):
+history_viewer.py:    def display(self, symbol=None):
+merge_project.py:def is_text_file(file_path):
+merge_project.py:def merge_project_files():
+src\trade_guardian\app\cli.py:    DEFAULT_CONFIG,
+src\trade_guardian\app\cli.py:def main():
+src\trade_guardian\app\cli.py:    p_init.add_argument("--path", type=str, default=None, help="Output path (default: ./config/config.json)")
+src\trade_guardian\app\cli.py:    p_scan.add_argument("--config", type=str, default=None, help="Config path (default: ./config/config.json)")
+src\trade_guardian\app\cli.py:    p_scan.add_argument("--strategy", type=str, default="auto", help="Strategy name (default: auto)")
+src\trade_guardian\app\cli.py:    p_scan.add_argument("--days", type=int, default=600)
+src\trade_guardian\app\cli.py:    p_scan.add_argument("--csv", type=str, default=None, help="Tickers csv path")
+src\trade_guardian\app\cli.py:    p_scan.add_argument("--min-score", type=int, default=60)
+src\trade_guardian\app\cli.py:    p_scan.add_argument("--max-risk", type=int, default=70)
+src\trade_guardian\app\cli.py:    p_scan.add_argument("--limit", type=int, default=0)
+src\trade_guardian\app\cli.py:    p_scan.add_argument("--top", type=int, default=None, help="Only show top N sorted blueprints")
+src\trade_guardian\app\cli.py:    p_scan.add_argument("--short-rank", type=int, default=None)
+src\trade_guardian\app\cli.py:    p_scan.add_argument("--min-short-dte", type=int, default=None)
+src\trade_guardian\app\cli.py:    p_scan.add_argument("--max-probe-rank", type=int, default=None)
+src\trade_guardian\app\cli.py:        write_config_template(out, DEFAULT_CONFIG, overwrite=args.force)
+src\trade_guardian\app\cli.py:        autogen_default = bool(DEFAULT_CONFIG.get("runtime", {}).get("autogen_config_if_missing", True))
+src\trade_guardian\app\cli.py:        autogen = autogen_default
+src\trade_guardian\app\cli.py:            write_config_template(cfg_path, DEFAULT_CONFIG, overwrite=False)
+src\trade_guardian\app\cli.py:        cfg = load_config(cfg_path, DEFAULT_CONFIG)
+src\trade_guardian\app\orchestrator.py:    def __init__(self, client, cfg: dict, policy, strategy=None):
+src\trade_guardian\app\orchestrator.py:    def _get_universe(self) -> List[str]:
+src\trade_guardian\app\orchestrator.py:    def scanlist(self, strategy_name: str = "auto", days: int = 600, 
+src\trade_guardian\app\orchestrator.py:                ctx = self.client.build_context(ticker, days=days)
+src\trade_guardian\app\orchestrator.py:    def _get_gate_status(self, row: ScanRow, bp: Optional[Blueprint], dna_type: str) -> str:
+src\trade_guardian\app\orchestrator.py:    def _print_enhanced_blueprint(self, bp: Blueprint, row: ScanRow, dna: str):
+src\trade_guardian\app\orchestrator.py:    def _get_temp(self, dna):
+src\trade_guardian\app\orchestrator.py:    def plan(self, ctx: Context, row: ScanRow) -> Optional[Blueprint]:
+src\trade_guardian\app\orchestrator.py:    def _load_strategy(self, name: str):
+src\trade_guardian\app\persistence.py:    def __init__(self, db_path: str = None):
+src\trade_guardian\app\persistence.py:    def save_scan_session(self, 
+src\trade_guardian\app\persistence.py:    def check_iv_spikes(self, current_batch_id: int, threshold: float = 3.0) -> List[Tuple[str, float]]:
+src\trade_guardian\app\persistence.py:    def get_latest_drift_1h(self, symbol: str) -> float:
+src\trade_guardian\app\renderer.py:    def __init__(self, cfg=None, policy=None, hv_cache_path: Optional[str] = None):
+src\trade_guardian\app\renderer.py:    def _sanitize_int(self, value: Any, default: int = 0) -> int:
+src\trade_guardian\app\renderer.py:            if isinstance(value, list): return self._sanitize_int(value[0], default) if value else default
+src\trade_guardian\app\renderer.py:            return default
+src\trade_guardian\app\renderer.py:            return default
+src\trade_guardian\app\renderer.py:    def render(self, 
+src\trade_guardian\app\renderer.py:    def render_diagnostics(self, strict: List[ScanRow], **kwargs):
+src\trade_guardian\app\renderer.py:    def _print_table(self, title: str, rows: List[ScanRow]):
+src\trade_guardian\app\renderer.py:    def _print_details(self, title: str, rows: List[ScanRow]):
+src\trade_guardian\app\renderer.py:    def _print_blueprints(self, title: str, rows: List[ScanRow]):
+src\trade_guardian\domain\features.py:    def __init__(self, cfg: dict, policy: ShortLegPolicy):
+src\trade_guardian\domain\features.py:    def _eligible_points(term: List[TermPoint], min_dte: int) -> List[TermPoint]:
+src\trade_guardian\domain\features.py:    def _baseline_iv(term: List[TermPoint], fallback_iv: float) -> float:
+src\trade_guardian\domain\features.py:    def build(self, term: List[TermPoint], hv: HVInfo, rank: int) -> Dict[str, object]:
+src\trade_guardian\domain\hv.py:    def __init__(self, client: SchwabClient, cache: JsonDailyCache):
+src\trade_guardian\domain\hv.py:    def get_hv(self, symbol: str) -> HVInfo:
+src\trade_guardian\domain\models.py:    meta: Dict[str, Any] = field(default_factory=dict)
+src\trade_guardian\domain\models.py:    legs: List[OrderLeg] = field(default_factory=list)
+src\trade_guardian\domain\policy.py:    def probe_ranks(self) -> List[int]:
+src\trade_guardian\domain\registry.py:    def __init__(self, cfg: dict, policy: ShortLegPolicy):
+src\trade_guardian\domain\registry.py:    def get(self, name: str):
+src\trade_guardian\domain\registry.py:        if n in ("auto", "smart", "default"):
+src\trade_guardian\domain\scoring.py:    def __init__(self, rules: ScoringRules):
+src\trade_guardian\domain\scoring.py:    def _hv_points(self, hv_rank: float) -> int:
+src\trade_guardian\domain\scoring.py:    def score_calendar(self, regime: str, curvature: str, edge: float, hv_rank: float) -> tuple[int, ScoreBreakdown]:
+src\trade_guardian\infra\cache.py:    def __init__(self, path: str):
+src\trade_guardian\infra\cache.py:    def _load(self):
+src\trade_guardian\infra\cache.py:    def _save(self):
+src\trade_guardian\infra\cache.py:    def _today() -> str:
+src\trade_guardian\infra\cache.py:    def get(self, key: str) -> Optional[dict]:
+src\trade_guardian\infra\cache.py:    def set(self, key: str, value: dict) -> None:
+src\trade_guardian\infra\cache.py:        self._data.setdefault("items", {})[key] = value
+src\trade_guardian\infra\config.py:DEFAULT_CONFIG: Dict[str, Any] = {
+src\trade_guardian\infra\config.py:def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+src\trade_guardian\infra\config.py:def load_config(path: str, default_cfg: Dict[str, Any]) -> Dict[str, Any]:
+src\trade_guardian\infra\config.py:        return dict(default_cfg)
+src\trade_guardian\infra\config.py:        return dict(default_cfg)
+src\trade_guardian\infra\config.py:    return _deep_merge(default_cfg, user_cfg)
+src\trade_guardian\infra\config.py:def write_config_template(path: str, default_cfg: Dict[str, Any], overwrite: bool = False) -> None:
+src\trade_guardian\infra\config.py:        json.dump(default_cfg, f, indent=2, ensure_ascii=False)
+src\trade_guardian\infra\config.py:def merge_config_paths(cfg: Dict[str, Any], root: str, csv_override: Optional[str]) -> Dict[str, Any]:
+src\trade_guardian\infra\config.py:    out.setdefault("paths", {})
+src\trade_guardian\infra\config.py:def _resolve_probe_count(pcfg: Dict[str, Any], base_rank: int) -> int:
+src\trade_guardian\infra\config.py:def policy_from_cfg_and_cli(cfg: Dict[str, Any], args) -> ShortLegPolicy:
+src\trade_guardian\infra\rate_limit.py:    def __init__(self, throttle_sec: float):
+src\trade_guardian\infra\rate_limit.py:    def sleep(self):
+src\trade_guardian\infra\retry_option_chain.py:def _utc_now_iso() -> str:
+src\trade_guardian\infra\retry_option_chain.py:def _safe_snippet(s: Any, max_len: int = 400) -> str:
+src\trade_guardian\infra\retry_option_chain.py:def classify_empty_response(
+src\trade_guardian\infra\retry_option_chain.py:def _write_jsonl(path: Path, record: Dict[str, Any]) -> None:
+src\trade_guardian\infra\retry_option_chain.py:def fetch_with_retry_and_diagnostics(
+src\trade_guardian\infra\retry_option_chain.py:def _sleep_backoff(attempt: int, retry: RetryConfig) -> None:
+src\trade_guardian\infra\schwab_client.py:    def __init__(self, cfg: dict = None):
+src\trade_guardian\infra\schwab_client.py:    def build_context(self, symbol: str, days: int = 600) -> Optional[Context]:
+src\trade_guardian\infra\schwab_client.py:            print(f"❌ [Error] build_context critical fail for {symbol}: {e}")
+src\trade_guardian\infra\schwab_client.py:    def _headers(self):
+src\trade_guardian\infra\schwab_client.py:    def get_quote(self, symbol: str) -> dict:
+src\trade_guardian\infra\schwab_client.py:    def calculate_hv_percentile(self, symbol: str) -> HVInfo:
+src\trade_guardian\infra\schwab_client.py:    def _fetch_calls_chain(self, symbol: str, from_d: str, to_d: str, range_val: str = "NTM") -> dict:
+src\trade_guardian\infra\schwab_client.py:    def scan_atm_term(self, symbol: str, days: int, contract_type: str = "CALL") -> tuple[float, list[TermPoint], dict]:
+src\trade_guardian\infra\schwab_token_manager.py:def fetch_schwab_token() -> str:
+src\trade_guardian\infra\schwab_token_manager_legacy.py:def fetch_schwab_token() -> Optional[str]:
+src\trade_guardian\infra\tickers.py:def load_tickers_csv(path: str) -> List[str]:
+src\trade_guardian\strategies\auto.py:    def __init__(self, cfg: dict, policy: ShortLegPolicy):
+src\trade_guardian\strategies\auto.py:    def evaluate(self, ctx: Context) -> ScanRow:
+src\trade_guardian\strategies\auto.py:    def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
+src\trade_guardian\strategies\base.py:    def evaluate(self, ctx: Context) -> ScanRow:
+src\trade_guardian\strategies\base.py:    def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
+src\trade_guardian\strategies\blueprint.py:def _extract_greeks_for(chain: Dict[str, Any], side: str, exp: str, strike: float) -> Dict[str, float]:
+src\trade_guardian\strategies\blueprint.py:def _extract_mid_for(chain: Dict[str, Any], side: str, exp: str, strike: float) -> Optional[float]:
+src\trade_guardian\strategies\blueprint.py:    def one_liner(self) -> str:
+src\trade_guardian\strategies\blueprint.py:    def one_liner(self) -> str:
+src\trade_guardian\strategies\blueprint.py:    def one_liner(self) -> str:
+src\trade_guardian\strategies\blueprint.py:def build_diagonal_blueprint(
+src\trade_guardian\strategies\blueprint.py:def build_straddle_blueprint(
+src\trade_guardian\strategies\blueprint.py:def build_calendar_blueprint(
+src\trade_guardian\strategies\calendar.py:    def __init__(self, cfg: dict, policy: ShortLegPolicy):
+src\trade_guardian\strategies\calendar.py:    def _tag(self, regime: str, curvature: str) -> str:
+src\trade_guardian\strategies\calendar.py:    def _clamp(x: float, lo: float, hi: float) -> float:
+src\trade_guardian\strategies\calendar.py:    def _risk_score(
+src\trade_guardian\strategies\calendar.py:    def evaluate(self, ctx: Context) -> ScanRow:
+src\trade_guardian\strategies\calendar.py:    def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
+src\trade_guardian\strategies\diagonal.py:    def __init__(self, cfg: dict, policy: ShortLegPolicy):
+src\trade_guardian\strategies\diagonal.py:    def _clamp(x: float, lo: float, hi: float) -> float:
+src\trade_guardian\strategies\diagonal.py:    def _find_strikes(self, ctx: Context, short_exp: str) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+src\trade_guardian\strategies\diagonal.py:            # LEAPS definition: usually > 1 year, but > 120 days is acceptable for diagonals
+src\trade_guardian\strategies\diagonal.py:    def evaluate(self, ctx: Context) -> ScanRow:
+src\trade_guardian\strategies\diagonal.py:    def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
+src\trade_guardian\strategies\hv_calendar.py:    def __init__(self, cfg: dict, policy: ShortLegPolicy):
+src\trade_guardian\strategies\hv_calendar.py:    def _hv_adjust(self, hv_rank: float) -> int:
+src\trade_guardian\strategies\hv_calendar.py:    def _find_point_gamma(ctx: Context, exp: str, dte: int) -> float:
+src\trade_guardian\strategies\hv_calendar.py:    def _best_effort_squeeze_ratio(ctx: Context) -> float:
+src\trade_guardian\strategies\hv_calendar.py:    def evaluate(self, ctx: Context) -> ScanRow:
+src\trade_guardian\strategies\hv_calendar.py:    def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
+src\trade_guardian\strategies\long_gamma.py:    def __init__(self, cfg: dict, policy: ShortLegPolicy):
+src\trade_guardian\strategies\long_gamma.py:    def _clamp(x: float, lo: float, hi: float) -> float:
+src\trade_guardian\strategies\long_gamma.py:    def evaluate(self, ctx: Context) -> ScanRow:
+src\trade_guardian\strategies\placeholder.py:    def __init__(self, cfg: dict, policy: ShortLegPolicy):
+src\trade_guardian\strategies\placeholder.py:    def evaluate(self, ctx: Context) -> ScanRow:
+src\trade_guardian\strategies\strategy2_stub.py:    def __init__(self, cfg: dict):
+src\trade_guardian\strategies\strategy2_stub.py:    def evaluate(self, ctx: Context) -> ScanRow:
+src\trade_guardian\strategies\strategy2_stub.py:    def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
+src\trade_guardian.py:def run_guardian_loop():
