@@ -270,8 +270,8 @@ def build_diagonal_blueprint(
     chain: Dict[str, Any],
     short_exp: str,
     long_exp: str,
-    target_short_strike: float, # 我们由策略层指定想卖哪个 Strike
-    target_long_strike: float,  # 我们由策略层指定想买哪个 Strike
+    target_short_strike: float,
+    target_long_strike: float,
     side: str = "CALL",
 ) -> Optional[DiagonalBlueprint]:
     
@@ -283,19 +283,26 @@ def build_diagonal_blueprint(
 
     est_debit = None
     note = ""
+    width = abs(target_short_strike - target_long_strike)
 
     if isinstance(short_mid, (int, float)) and isinstance(long_mid, (int, float)):
         est_debit = float(long_mid - short_mid)
         
-        # [关键风控] PMCC 黄金法则检查：
-        # 宽幅 (Width) 必须大于 Debit，否则股价暴涨时会亏损
-        width = abs(target_short_strike - target_long_strike)
+        # [关键修改] 硬过滤逻辑
+        # 如果 Debit > Width，说明是“锁定亏损”结构，直接拒绝生成蓝图
         if est_debit > width:
-            note = f"WARNING: Debit ({est_debit:.2f}) > Width ({width:.2f}) - Lock-in Loss Risk!"
+            # 这里的 return None 会导致这个蓝图不被创建
+            # Orchestrator 会认为生成失败，从而不显示在 Actionable 列表中
+            # 这就实现了 "Filter" 的效果
+            return None 
+            
+            # 如果你想保留但标记为无效，可以抛出异常或返回特定对象，但 return None 最简单有效
         else:
             note = f"Healthy PMCC Setup. Width={width:.2f}"
+            
     else:
-        note = "missing bid/ask mid for one leg"
+        # 如果价格拿不到，也没法做，直接 None
+        return None
 
     return DiagonalBlueprint(
         symbol=symbol,
@@ -305,7 +312,7 @@ def build_diagonal_blueprint(
         long_exp=long_exp,
         long_strike=target_long_strike,
         est_debit=est_debit,
-        width=abs(target_short_strike - target_long_strike),
+        width=width,
         max_loss=est_debit,
         note=note,
     )
