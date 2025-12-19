@@ -216,7 +216,7 @@ class TradeGuardian:
 
         risk_label = "NORMAL"
         if est_gamma >= 0.20: risk_label = "EXTREME ⛔"
-        elif est_gamma >= 0.12: risk_label = "HIGH ⚠️"
+        elif est_gamma >= 0.12: risk_label = "HIGH ⚠️  "
         elif est_gamma >= 0.08: risk_label = "ELEVATED 🔸"
         
         risk_alert = f" [{risk_label}]" if est_gamma >= 0.08 else ""
