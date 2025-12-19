@@ -1,20 +1,9 @@
 from __future__ import annotations
-
-from trade_guardian.domain.models import (
-    Context,
-    ScanRow,
-    ScoreBreakdown,
-    RiskBreakdown,
-)
+from trade_guardian.domain.models import Context, ScanRow, ScoreBreakdown, RiskBreakdown
 from trade_guardian.domain.policy import ShortLegPolicy
 from trade_guardian.strategies.base import Strategy
 
-
 class LongGammaStrategy(Strategy):
-    """
-    Strategy: Long Gamma / Straddle
-    Logic: Buy cheap volatility, avoiding high Gamma risk zones.
-    """
     name = "long_gamma"
 
     def __init__(self, cfg: dict, policy: ShortLegPolicy):
@@ -27,109 +16,73 @@ class LongGammaStrategy(Strategy):
 
     def evaluate(self, ctx: Context) -> ScanRow:
         tsf = ctx.tsf
-        regime = str(tsf["regime"])
-        curvature = str(tsf["curvature"])
+        symbol = ctx.symbol
         
-        target_exp = str(tsf["short_exp"])
-        target_dte = int(tsf["short_dte"])
-        target_iv = float(tsf["short_iv"])
-        hv_rank = float(ctx.hv.hv_rank)
-        price = float(ctx.price)
-        current_hv = float(ctx.hv.current_hv)
-
-        # [Edge Calculation]
-        if target_iv > 0:
-            raw_edge = (current_hv - target_iv) / target_iv
-        else:
-            raw_edge = 0.0
-
-        # --- Scoring (0-100) ---
-        bd = ScoreBreakdown(base=50)
-
-        # 1. HV Rank (低位适合买入)
-        if hv_rank <= 20: bd.hv = +15
-        elif hv_rank <= 40: bd.hv = +5
-        elif hv_rank >= 80: bd.hv = -20 
-        elif hv_rank >= 60: bd.hv = -10
-
-        # 2. Regime
-        if regime == "CONTANGO": bd.regime = +5
-        elif regime == "BACKWARDATION": bd.regime = -15 
+        # 1. 提取三点数据
+        short_iv = float(tsf.get("short_iv", 0.0))
+        edge_micro = float(tsf.get("edge_micro", 0.0))
+        edge_month = float(tsf.get("edge_month", 0.0))
         
-        # 3. Edge Impact
-        if raw_edge > 0.1: bd.edge = +10
-        elif raw_edge < -0.1: bd.edge = -10
-
-        score = bd.base + bd.regime + bd.edge + bd.hv + bd.curvature + bd.penalties
+        # 2. 评分逻辑 (双因子驱动)
+        score = 60
+        # Micro Edge: 短期必须便宜 (权重 40%)
+        score += int(self._clamp(edge_micro * 40, -20, 20))
+        # Month Edge: 结构必须支撑 (权重 60%)
+        score += int(self._clamp(edge_month * 60, -20, 30))
         
-        # --- Risk (Gamma Integrated) ---
+        score = self._clamp(score, 0, 100)
+
+        # 3. 构造 Gate 信号 (三段式风控)
+        gate = "WAIT"
+        dna = "QUIET" # 稍后 Orchestrator 会更新动能
+        
+        # 基础门槛
+        if score > 75 and edge_micro > 0.05 and edge_month > 0.10:
+            gate = "READY" # 介于 WAIT 和 EXEC 之间，等待动能触发
+        
+        if symbol in ["TSLL", "TQQQ", "SOXL", "ONDS", "SMCI", "IWM"]:
+            gate = "FORBID"
+
+        # 4. 构造 Tag
+        tag = "LG"
+        if edge_micro > 0.15: tag += "-M" # Micro 极好
+        if edge_month > 0.30: tag += "-K" # Month 极好 (K=Structure)
+
+        # 5. 返回 ScanRow (meta 携带全量双基准数据)
+        bd = ScoreBreakdown(base=60) 
         rbd = RiskBreakdown(base=20)
-
-        # 1. Theta Risk
-        if target_dte < 7: rbd.dte = +30
-        elif target_dte < 14: rbd.dte = +20
-        elif target_dte < 21: rbd.dte = +10
-        
-        # 2. Gamma Risk Calculation (Total Position)
-        est_gamma = 0.0
-        if ctx.metrics and hasattr(ctx.metrics, 'gamma'):
-            # [Fix] 这里的 Gamma 是单腿的，Straddle 有两条腿，所以风险 x2
-            est_gamma = float(ctx.metrics.gamma) * 2.0
-        else:
-            # Fallback estimation (公式本身就是估算 Straddle 的，所以不用乘2)
-            try:
-                vol_decimal = target_iv / 100.0 if target_iv > 2.0 else target_iv
-                dte_years = max(1, target_dte) / 365.0
-                if price > 0 and vol_decimal > 0:
-                    est_gamma = 0.8 / (price * vol_decimal * (dte_years ** 0.5))
-            except:
-                est_gamma = 0.0
-
-        # [Calibration] Total Gamma Thresholds
-        # 0.20+ : EXTREME (e.g. ONDS) -> +50 Risk
-        # 0.12+ : HIGH    (e.g. TSLL, TQQQ) -> +30 Risk
-        # 0.08+ : ELEVATED (e.g. SOXL) -> +15 Risk
-        
-        if est_gamma >= 0.20:
-            rbd.gamma = +50
-        elif est_gamma >= 0.12:
-            rbd.gamma = +30
-        elif est_gamma >= 0.08:
-            rbd.gamma = +15
-        
-        # 3. Regime Risk
-        if regime == "BACKWARDATION": rbd.regime = +10
-        
-        # 4. Valuation Risk
-        if hv_rank > 60: rbd.regime += 10
-
-        risk = rbd.base + rbd.dte + rbd.gamma + rbd.regime
-
-        tag = "LG" 
-        if regime == "CONTANGO": tag += "-C"
         
         row = ScanRow(
-            symbol=ctx.symbol,
-            price=price,
-            short_exp=target_exp, 
-            short_dte=target_dte,
-            short_iv=target_iv,
-            base_iv=float(tsf["base_iv"]),
-            edge=float(f"{raw_edge:.2f}"), 
-            hv_rank=hv_rank,
-            regime=regime,
-            curvature=curvature,
+            symbol=symbol,
+            price=float(ctx.price),
+            short_exp=tsf.get("short_exp", ""),
+            short_dte=int(tsf.get("short_dte", 0)),
+            short_iv=short_iv,
+            base_iv=tsf.get("month_iv", 0.0), # 兼容老字段
+            edge=edge_month,                 # 兼容老字段
+            hv_rank=50.0,
+            regime="NORMAL",
+            curvature="FLAT",
             tag=tag,
-            cal_score=int(self._clamp(float(score), 0, 100)),
-            short_risk=int(self._clamp(float(risk), 0, 100)),
+            cal_score=int(score),
+            short_risk=20,
             score_breakdown=bd,
             risk_breakdown=rbd,
         )
         
+        # 将双基准放入 meta，供 UI 渲染
         row.meta = {
-            "strategy": "long_gamma",
-            "est_gamma": float(f"{est_gamma:.4f}"),
-            "raw_edge": raw_edge
+            "micro_exp": tsf.get("micro_exp"),
+            "micro_dte": tsf.get("micro_dte"),
+            "micro_iv": tsf.get("micro_iv"),
+            "edge_micro": edge_micro,
+            
+            "month_exp": tsf.get("month_exp"),
+            "month_dte": tsf.get("month_dte"),
+            "month_iv": tsf.get("month_iv"),
+            "edge_month": edge_month,
+            
+            "est_gamma": float(ctx.metrics.gamma) * 2.0 if ctx.metrics else 0.0,
+            "strike": round(float(ctx.price), 1)
         }
-
         return row

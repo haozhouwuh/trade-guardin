@@ -4,12 +4,28 @@ import requests
 import numpy as np
 import pandas as pd
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from urllib.parse import quote
 from typing import Optional, Any
 
 from trade_guardian.domain.models import Context, IVData, HVInfo, TermPoint
 from trade_guardian.infra.schwab_token_manager import fetch_schwab_token
+
+# --- Helper Functions (定义在类外部) ---
+def _to_date(iso: str) -> date:
+    return datetime.strptime(iso, "%Y-%m-%d").date()
+
+def is_third_friday(d: date) -> bool:
+    """判断是否为标准月度期权 (第三个周五)"""
+    # Friday is 4, range 15-21 ensures it's the 3rd Friday
+    return d.weekday() == 4 and 15 <= d.day <= 21
+
+def get_series_kind(exp_str: str) -> str:
+    """根据到期日判断合约类型：MONTHLY, WEEKLY, DAILY"""
+    d = _to_date(exp_str)
+    if is_third_friday(d): return "MONTHLY"
+    if d.weekday() == 4: return "WEEKLY"
+    return "DAILY"
 
 class SchwabClient:
     OPTION_CHAIN_URL = "https://api.schwabapi.com/marketdata/v1/chains"
@@ -34,7 +50,7 @@ class SchwabClient:
             try:
                 price, term_points, raw_chain = self.scan_atm_term(symbol, days)
             except Exception as e:
-                print(f"  [Warn] Chain scan failed for {symbol}: {e}")
+                # print(f"  [Warn] Chain scan failed for {symbol}: {e}")
                 return None
 
             if not term_points:
@@ -43,64 +59,114 @@ class SchwabClient:
             # 3. 分析期限结构 (Term Structure)
             term_points.sort(key=lambda x: x.dte)
 
-            # --- [逻辑修正：释放天期权灵敏度] ---
-            # A. 寻找 Short Term (目标：1-10 DTE 范围内的最近有效合约)
+            # --- [Step A: 寻找 Short Leg (目标 1-10 DTE)] ---
             short_candidates = [p for p in term_points if 1 <= p.dte <= 10]
-            
-            if not short_candidates:
-                # 如果 10 天内没有任何期权，选择全场最近的
-                short_point = min(term_points, key=lambda x: x.dte)
-            else:
-                # 核心逻辑：选出范围内 DTE 最小的合约，避开 0DTE (当天到期)
-                # 这样 SPY/QQQ 会选到 1-3 天，而 NVDA 会选到 7 天
+            if short_candidates:
+                # 避开 0DTE，选最近的
                 short_point = min(short_candidates, key=lambda x: x.dte if x.dte > 0 else 999)
-            
-            # B. 寻找 Base Term (目标：45-60 DTE 作为基准锚点)
-            base_candidates = [p for p in term_points if 40 <= p.dte <= 90]
-            if not base_candidates:
-                base_point = min(term_points, key=lambda x: abs(x.dte - 60))
             else:
-                base_point = min(base_candidates, key=lambda x: abs(x.dte - 50))
-            # ------------------------------------
-
-            # 4. 确定 IV 和 Regime
-            short_iv = short_point.iv
-            base_iv = base_point.iv
+                short_point = term_points[0]
             
-            if base_iv == 0: base_iv = short_iv if short_iv > 0 else 1.0
+            # 提取 Short 的特征，供后续匹配
+            short_kind = get_series_kind(short_point.exp)
+            short_weekday = _to_date(short_point.exp).weekday()
 
-            # 判断期限结构状态
-            regime = "CONTANGO" if base_iv > short_iv else "BACKWARDATION"
-            if abs(base_iv - short_iv) < 1.5:
-                regime = "NORMAL"
+            # --- [Step B: 寻找 Micro Base (短期节奏, 强制 > Short)] ---
+            # 目标：寻找比 Short 更远的下一阶合约 (Next Step)
+            # 修正核心：p.dte > short_point.dte
+            micro_target = 10
+            micro_pool = [p for p in term_points if short_point.dte < p.dte <= 21]
+            
+            micro_point = None
+            if not micro_pool:
+                # 极罕见情况：没有比 Short 更远的合约了，退化为 Short (Edge=0)
+                micro_point = short_point
+            else:
+                # 1. 优先找同 Weekday (日期对日期)
+                micro_best = [p for p in micro_pool if _to_date(p.exp).weekday() == short_weekday]
+                
+                if not micro_best:
+                    # 2. 退回同 Kind (比如都是 Weekly)
+                    micro_best = [p for p in micro_pool if get_series_kind(p.exp) == short_kind]
+                
+                if not micro_best:
+                     # 3. 兜底 (只要比 Short 远就行)
+                     micro_best = micro_pool
 
-            # 5. 组装 IVData
-            iv_data = IVData(
-                rank=hv_info.hv_rank,
-                percentile=0.0,
-                current_iv=short_iv,
-                hv_rank=hv_info.hv_rank,
-                current_hv=hv_info.current_hv
-            )
+                # 在符合条件的池子里，找最接近 micro_target (10) 的
+                micro_point = min(micro_best, key=lambda x: abs(x.dte - micro_target))
 
-            # 6. 组装 TSF (Term Structure Factors)
+            # --- [Step C: 寻找 Month Base (结构锚点, 目标 25-50 DTE)] ---
+            month_target = 30
+            month_pool = [p for p in term_points if 25 <= p.dte <= 50]
+            
+            month_point = None
+            if not month_pool:
+                # 兜底全场找最接近 30 的
+                month_point = min(term_points, key=lambda x: abs(x.dte - month_target))
+            else:
+                # 1. 优先找同 Kind (主要是 Monthly 对 Monthly)
+                month_best = [p for p in month_pool if get_series_kind(p.exp) == short_kind]
+                
+                if not month_best:
+                    # 2. 兜底全场
+                    month_best = month_pool
+                
+                month_point = min(month_best, key=lambda x: abs(x.dte - month_target))
+
+            # ----------------------------------------
+
+            # 4. 数据计算与组装
+            short_iv = short_point.iv
+            micro_iv = micro_point.iv
+            month_iv = month_point.iv
+            
+            # 防止除零
+            if micro_iv == 0: micro_iv = short_iv if short_iv > 0 else 1.0
+            if month_iv == 0: month_iv = short_iv if short_iv > 0 else 1.0
+
+            # 5. 组装 TSF：包含双基准全量信息
             tsf = {
-                "regime": regime,
+                "regime": "NORMAL", # 占位
                 "curvature": "FLAT",
+                
+                # Short Leg Info
                 "short_exp": short_point.exp,
                 "short_dte": short_point.dte,
                 "short_iv": short_iv,
-                "base_iv": base_iv
+                "short_kind": short_kind,
+
+                # Micro Base Info
+                "micro_exp": micro_point.exp,
+                "micro_dte": micro_point.dte,
+                "micro_iv": micro_iv,
+                
+                # Month Base Info
+                "month_exp": month_point.exp,
+                "month_dte": month_point.dte,
+                "month_iv": month_iv,
+                
+                # Pre-calculated Edges (双 Edge)
+                "edge_micro": (micro_iv - short_iv) / short_iv if short_iv > 0 else 0.0,
+                "edge_month": (month_iv - short_iv) / short_iv if short_iv > 0 else 0.0
             }
 
-            # 7. 组装 Metrics (Greeks)
+            # 6. 组装 Greeks & Data Assembly
+            iv_data = IVData(
+                rank=hv_info.hv_rank, 
+                percentile=0.0, 
+                current_iv=short_iv, 
+                hv_rank=hv_info.hv_rank, 
+                current_hv=hv_info.current_hv
+            )
+            
             class Metrics: pass
             metrics = Metrics()
             metrics.gamma = short_point.gamma
             metrics.delta = short_point.delta
             metrics.theta = short_point.theta
 
-            # 8. 返回 Context
+            # 7. 返回 Context
             return Context(
                 symbol=symbol,
                 price=price,
