@@ -20,6 +20,15 @@ def init_db():
         print(f"🛠️  Creating DB folder: {db_folder}")
         os.makedirs(db_folder)
     
+    # 🚨 [新增逻辑] 暴力重置：如果旧库存在，直接删除，确保新字段生效！
+    if os.path.exists(db_path):
+        try:
+            os.remove(db_path)
+            print(f"💥 Deleted old database to apply new schema: {db_path}")
+        except Exception as e:
+            print(f"❌ Error deleting old DB: {e}")
+            return
+
     print(f"🔗 Connecting to database: {db_path}")
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
@@ -55,6 +64,7 @@ def init_db():
             price REAL,               -- 现价
             iv_short REAL,            -- 短端 IV (29 DTE)
             iv_base REAL,             -- 长端基准 IV
+            edge REAL,                -- Edge Value
             hv_rank REAL,             -- 历史波动率排名
             regime TEXT,              -- 期限结构 (CONTANGO/BACKWARDATION)
             FOREIGN KEY(batch_id) REFERENCES scan_batches(batch_id)
@@ -76,6 +86,7 @@ def init_db():
             est_debit REAL,           -- 估算权利金成本
             error_msg TEXT,           -- 如果被拒绝，记录原因 (如 Debit > Width)
             blueprint_json TEXT,      -- 完整的蓝图结构 (JSON 格式)
+            tag TEXT,                 -- [新增] 策略标签 (LG-M-K)
             FOREIGN KEY(snapshot_id) REFERENCES market_snapshots(snapshot_id)
         )
     ''')
@@ -85,11 +96,22 @@ def init_db():
     # 验证表数量
     c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
     tables = c.fetchall()
+    
+    # 验证字段是否存在
+    c.execute("PRAGMA table_info(trade_plans)")
+    tp_cols = [row[1] for row in c.fetchall()]
+    
     conn.close()
 
     print(f"\n✅ SUCCESS! Trade Guardian DB initialized with {len(tables)} tables:")
     for t in tables:
         print(f"   - {t[0]}")
+    
+    if 'tag' in tp_cols:
+        print(f"🎉 Verification: 'tag' column successfully added!")
+    else:
+        print(f"❌ Verification Failed: 'tag' column missing!")
+
     print(f"\n🎯 Database Location: {db_path}")
 
 if __name__ == "__main__":
