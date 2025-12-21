@@ -5,104 +5,74 @@ from typing import Optional, Tuple
 from trade_guardian.domain.models import Context, Recommendation, ScanRow
 from trade_guardian.domain.policy import ShortLegPolicy
 from trade_guardian.strategies.base import Strategy
-
-# [关键变更] 导入 Diagonal 而不是 Calendar
 from trade_guardian.strategies.diagonal import DiagonalStrategy
 from trade_guardian.strategies.long_gamma import LongGammaStrategy
 
 
 class AutoStrategy(Strategy):
     """
-    Strategy #5: Auto / Smart Router (Final Version)
-    Analyzes Vol Regime & HV Rank to dispatch to the best sub-strategy.
+    Strategy #5: Auto / Smart Router (Brain V5 - Structure First)
     
-    Sub-Strategies:
-      1. Long Gamma (Straddle): For Low Vol / Contango environments.
-      2. Diagonal (PMCC): For Mid-High Vol / Structural plays.
+    Philosophy:
+      - Structure Trumps Volatility: If the Term Structure offers a good edge (>0.20),
+        we prioritize Diagonal spreads to harvest Theta/Vega differential, even if IV is low.
+      - Low Vol Fallback: Only when structure is flat do we revert to Long Gamma (Straddle)
+        to play for pure expansion.
     
-    Logic:
-      - Low Vol (HV < 35): Force Long Gamma
-      - High Vol (HV > 55) or Backwardation: Force Diagonal
-      - Mid Vol (35 <= HV <= 55): Run BOTH, pick the one with higher Score.
+    Routing Order:
+      1. Backwardation -> LG (Defense)
+      2. Edge > 0.20   -> DIAG (Attack Structure)
+      3. HV < 30       -> LG (Attack Vol Floor)
+      4. Default       -> LG
     """
     name = "auto"
 
     def __init__(self, cfg: dict, policy: ShortLegPolicy):
         self.cfg = cfg
         self.policy = policy
-        # 初始化双核引擎
-        self.diagonal = DiagonalStrategy(cfg, policy)     # 替代了原来的 Calendar
+        self.diagonal = DiagonalStrategy(cfg, policy)
         self.long_gamma = LongGammaStrategy(cfg, policy)
 
     def evaluate(self, ctx: Context) -> ScanRow:
-        """
-        Routing Logic:
-        1. Get HV Rank & Regime
-        2. Decide Strategy (Deterministic or Competitive)
-        3. Delegate evaluate()
-        4. Tag result with AUTO prefix
-        """
         hv_rank = float(ctx.hv.hv_rank)
-        regime = str(ctx.tsf.get("regime", "FLAT"))
+        tsf = ctx.tsf
+        regime = str(tsf.get("regime", "FLAT"))
+        edge_month = float(tsf.get("edge_month", 0.0))
 
-        # --- 决策逻辑 (Brain) ---
+        # --- 决策逻辑 (Brain V5) ---
         
-        # 1. [明确低波动] 且结构健康 -> 倾向 Long Gamma
-        # HV Rank < 35 且非倒挂，适合做多波动率
-        if hv_rank < 35 and regime != "BACKWARDATION":
+        # 1. [倒挂保护] Backwardation -> 强制 Long Gamma
+        # 这种时候卖近端是自杀，必须防守
+        if regime == "BACKWARDATION":
             row = self.long_gamma.evaluate(ctx)
-            # Tag: LG-C -> AUTO-LG-C
-            row.tag = f"AUTO-{row.tag}"
+            row.tag = f"AUTO-LG"
+            return row
+
+        # 2. [结构优先] 只要 Edge 足够好 (> 0.20)，优先做 Diagonal
+        # 即使 HV 很低，优秀的结构也能提供比 Straddle 更好的盈亏比
+        # (包含了 > 0.35 的超级结构情况)
+        if edge_month >= 0.20:
+            row_diag = self.diagonal.evaluate(ctx)
+            # 只有构建成功才返回，否则掉下去走兜底
+            if row_diag and row_diag.meta and "long_strike" in row_diag.meta:
+                row_diag.tag = f"AUTO-DIAG" 
+                return row_diag
+
+        # 3. [低波博弈] 结构平庸，但波动率在地板 -> 强制 Long Gamma
+        # NVDA (Edge 0.16) 会落到这里
+        if hv_rank < 30:
+            row = self.long_gamma.evaluate(ctx)
+            row.tag = f"AUTO-LG" 
             return row
         
-        # 2. [明确高波动] 或 [倒挂] -> 倾向 Diagonal (PMCC)
-        # 此时买 Straddle 太贵，不如用 PMCC 降低成本或观望
-        elif hv_rank > 55 or regime == "BACKWARDATION":
-            row = self.diagonal.evaluate(ctx)
-            # Tag: PMCC-C -> AUTO-PMCC-C
-            row.tag = f"AUTO-{row.tag}"
-            return row
-
-        # 3. [模糊地带 / 竞争区域] 35 <= HV <= 55
-        # 两个策略都跑一遍，谁分高选谁
-        else:
-            res_lg = self.long_gamma.evaluate(ctx)
-            res_diag = self.diagonal.evaluate(ctx)
-
-            # 比较分数 (Score)
-            if res_lg.cal_score >= res_diag.cal_score:
-                # Long Gamma 胜出
-                row = res_lg
-                row.tag = f"AUTO-{row.tag}"
-                return row
-            else:
-                # Diagonal 胜出
-                row = res_diag
-                row.tag = f"AUTO-{row.tag}"
-                return row
+        # 4. [默认兜底] 结构平坦且波动率中等 -> Long Gamma
+        row = self.long_gamma.evaluate(ctx)
+        row.tag = f"AUTO-LG"
+        return row
 
     def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
-        """
-        Recommendation routing logic matches evaluate logic.
-        """
-        hv_rank = float(ctx.hv.hv_rank)
-        regime = str(ctx.tsf.get("regime", "FLAT"))
-
-        # 1. Force Long Gamma
-        if hv_rank < 35 and regime != "BACKWARDATION":
-            return self.long_gamma.recommend(ctx, min_score, max_risk)
-        
-        # 2. Force Diagonal
-        elif hv_rank > 55 or regime == "BACKWARDATION":
+        row = self.evaluate(ctx)
+        if "DIAG" in row.tag:
             return self.diagonal.recommend(ctx, min_score, max_risk)
-        
-        # 3. Competitive
         else:
-            # 复用 evaluate 的结果来决定调用谁
-            row_lg = self.long_gamma.evaluate(ctx)
-            row_diag = self.diagonal.evaluate(ctx)
-
-            if row_lg.cal_score >= row_diag.cal_score:
-                return self.long_gamma.recommend(ctx, min_score, max_risk)
-            else:
-                return self.diagonal.recommend(ctx, min_score, max_risk)
+            return self.long_gamma.recommend(ctx, min_score, max_risk)

@@ -11,17 +11,20 @@ from trade_guardian.domain.models import (
 )
 from trade_guardian.domain.policy import ShortLegPolicy
 from trade_guardian.strategies.base import Strategy
+from trade_guardian.strategies.blueprint import build_diagonal_blueprint
 
 
 class DiagonalStrategy(Strategy):
     """
-    Strategy #6: Diagonal Spread / PMCC (Poor Man's Covered Call)
+    Strategy #6: Tactical Diagonal (Lightweight)
     
     Logic:
-      - Buy Deep ITM LEAPS (Long Term) -> Substitute for Stock (High Delta)
-      - Sell OTM Near Term Call -> Income Generation (High Theta)
-      - Ideal for Bullish Long-term + Neutral/Bullish Short-term
-      - Likes Contango (Long term IV < Short term IV)
+      - Long Leg: Uses the 'Month Anchor' (~30-45 DTE) found by Curve Analysis.
+      - Short Leg: Uses the 'Short Anchor' (1-10 DTE).
+      - Strikes: 
+          Long @ ATM/ITM (High Vega, Low Delta Cost)
+          Short @ OTM (Income)
+      - Goal: Capture Term Structure Edge without the heavy capital of PMCC LEAPS.
     """
     name = "diagonal"
 
@@ -33,223 +36,175 @@ class DiagonalStrategy(Strategy):
     def _clamp(x: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, x))
     
-    def _find_strikes(self, ctx: Context, short_exp: str) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+    def _find_strikes(self, ctx: Context) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+        """
+        寻找轻量级 Diagonal 的行权价结构：
+        Long: Month Exp @ First ITM or ATM
+        Short: Short Exp @ First OTM
+        """
         price = ctx.price
         chain = ctx.raw_chain
+        tsf = ctx.tsf
         
-        # ---------------------------------------------------------
-        # 1. 寻找 Short Leg (卖方腿) - Near Term OTM Call
-        # ---------------------------------------------------------
+        # 1. 锁定到期日 (直接复用 Curve 算法的结果)
+        short_exp = tsf.get("short_exp")
+        long_exp = tsf.get("month_exp") # 使用优化过的 35DTE 锚点，不再是 LEAPS
+
+        if not short_exp or not long_exp:
+            return None, None, None
+        
+        # 2. 获取 Strike Map
         call_map = chain.get("callExpDateMap", {})
-        short_strikes_map = None
-        for k in call_map.keys():
-            if k.startswith(short_exp):
-                short_strikes_map = call_map[k]
-                break
         
-        if not short_strikes_map: 
+        # 辅助函数：找特定日期的 strikes
+        def get_strikes_for_exp(exp_date_str):
+            # 模糊匹配日期前缀
+            for k, v in call_map.items():
+                if k.startswith(exp_date_str):
+                    return sorted([float(s) for s in v.keys()])
+            return []
+
+        short_strikes = get_strikes_for_exp(short_exp)
+        long_strikes = get_strikes_for_exp(long_exp)
+
+        if not short_strikes or not long_strikes:
             return None, None, None
 
-        avail_strikes = sorted([float(s) for s in short_strikes_map.keys()])
+        # 3. 选择行权价 (Tactical Light Setup)
         
-        # 找 First OTM，通常保留一点缓冲 (e.g. 1.01% - 1.02%)
-        # [Safety] strictly ensure it is OTM. If price is 100, we want > 101.
-        short_strike = next((s for s in avail_strikes if s > price * 1.015), None)
+        # Short Leg: 卖出第一档虚值 (OTM)
+        # 逻辑：找 > Price 的最小 Strike
+        short_strike = next((s for s in short_strikes if s > price * 1.005), None)
         
-        # 如果找不到合适的 OTM，说明当前 Chain 都在实值或者数据缺失，不要强行选取
-        if not short_strike: 
-            return None, None, None
+        # Long Leg: 买入第一档实值 (ITM) 或 平值 (ATM)
+        # 逻辑：找 <= Price 的最大 Strike
+        # 这里用 <= Price 确保是 ITM 或 ATM，比 OTM 的 Short 腿低，构成正向对角
+        long_strike_candidates = [s for s in long_strikes if s <= price]
+        long_strike = long_strike_candidates[-1] if long_strike_candidates else long_strikes[0]
 
-        # ---------------------------------------------------------
-        # 2. 寻找 Long Leg (买方腿) - Deep ITM LEAPS
-        # ---------------------------------------------------------
-        long_candidates = []
-        for exp_key in call_map.keys():
-            parts = exp_key.split(":")
-            exp_date = parts[0]
-            try: 
-                days = int(parts[1])
-            except (IndexError, ValueError): 
-                continue
-            
-            # LEAPS definition: usually > 1 year, but > 120 days is acceptable for diagonals
-            if days > 120: 
-                long_candidates.append((exp_date, days))
-        
-        if not long_candidates: 
-            return None, None, None
-
-        # 优先选 150-450 天 (Sweet spot for Theta decay curve vs Vega exposure)
-        ideal = [c for c in long_candidates if 150 <= c[1] <= 450]
-        if ideal:
-            ideal.sort(key=lambda x: x[1])
-            best_long_exp = ideal[0][0] # Pick the shortest valid LEAP to save Debit
-            # best_long_days = ideal[0][1]
-        else:
-            long_candidates.sort(key=lambda x: x[1])
-            best_long_exp = long_candidates[0][0]
-            # best_long_days = long_candidates[0][1]
-        
-        long_strikes_map = None
-        # 模糊匹配 Long Exp Key
-        for k in call_map.keys():
-            if k.startswith(best_long_exp):
-                long_strikes_map = call_map[k]
-                break
-        
-        if not long_strikes_map: 
-            return None, None, None
-
-        long_avail_strikes = sorted([float(s) for s in long_strikes_map.keys()])
-        
-        # [核心逻辑] Select Long Strike (Deep ITM)
-        # Target: ~70-75 Delta substitute. Roughly Price * 0.70 to 0.75.
-        target_strike = price * 0.70 
-        
-        # Find closest available strike
-        long_strike = min(long_avail_strikes, key=lambda x: abs(x - target_strike))
-
-        # [Safety Check] PMCC Golden Rule: Short Strike MUST be > Long Strike
+        # [保底逻辑] 确保 Long Strike < Short Strike (Call Diagonal 规则)
         if long_strike >= short_strike:
-            # Try to force a lower strike if available
-            lower_candidates = [s for s in long_avail_strikes if s < short_strike]
-            if lower_candidates:
-                long_strike = lower_candidates[0] # Aggressively deep
+            # 尝试下移 Long Strike
+            lower = [s for s in long_strikes if s < short_strike]
+            if lower:
+                long_strike = lower[-1]
             else:
-                return None, None, None # Cannot form a diagonal
+                # 实在没空间 (比如股价正好卡在两个 Strike 中间)，做 Calendar (同价)
+                # Calendar 也是一种特殊的 Diagonal
+                long_strike = short_strike
 
-        return short_strike, best_long_exp, long_strike
+        return short_strike, long_exp, long_strike
 
     def evaluate(self, ctx: Context) -> ScanRow:
         tsf = ctx.tsf
-        regime = str(tsf["regime"])
         hv_rank = float(ctx.hv.hv_rank)
         price = float(ctx.price)
         
-        # 获取 IV 数据
-        short_iv = float(tsf["short_iv"])
-        base_iv = float(tsf["base_iv"]) 
+        # 基础数据
+        short_iv = float(tsf.get("short_iv", 0))
+        edge_month = float(tsf.get("edge_month", 0)) # 这是关键 Edge
         
-        # [新增] 1. 计算 Edge (Short IV vs Long IV)
-        if base_iv > 0:
-            raw_edge = (short_iv - base_iv) / base_iv
-        else:
-            raw_edge = 0.0
-
         # 寻找结构
-        short_strike, long_exp, long_strike = self._find_strikes(ctx, str(tsf["short_exp"]))
+        short_strike, long_exp, long_strike = self._find_strikes(ctx)
         
-        # --- Scoring (0-100) ---
+        # --- Scoring ---
         bd = ScoreBreakdown(base=50)
-
-        # [修改] 连续打分逻辑
-        edge_score = int(self._clamp(raw_edge * 100, -20, 25))
-        bd.edge = edge_score
-
-        hv_score = int((50 - hv_rank) / 3)
-        bd.hv = int(self._clamp(hv_score, -15, 15))
-
-        if regime == "CONTANGO": 
-            bd.regime = +15 
-        elif regime == "NORMAL": 
-            bd.regime = +5
-        elif regime == "BACKWARDATION": 
-            bd.regime = -25 
-
-        if not (short_strike and long_strike):
-            bd.penalties = -999 
         
-        # 负 Edge 惩罚
-        if raw_edge < -0.05:
-            bd.penalties -= 20
+        # Edge 驱动 (权重最大)
+        bd.edge = int(self._clamp(edge_month * 80, -20, 40))
+        
+        # 结构分
+        if short_strike and long_strike:
+            bd.base += 10 # 成功构建结构奖励
+        else:
+            bd.penalties = -999 # 构建失败
+
+        # 负 Edge 惩罚 (Backwardation 不适合做 Diagonal)
+        if edge_month < 0:
+            bd.regime = -30
 
         score = bd.base + bd.regime + bd.edge + bd.hv + bd.curvature + bd.penalties
-
-        # --- Risk (Gamma Integration) ---
-        rbd = RiskBreakdown(base=30)
         
-        # [新增] 2. Gamma 风险估算 (这就是您要找的逻辑！)
-        est_gamma = 0.0 
-        try:
-            # 简化的 Gamma 估算：用于捕捉 ONDS 这种短久期高风险票
-            # 公式原理: Gamma ∝ 1 / (S * σ * √T)
-            dte_years = max(1, int(tsf["short_dte"])) / 365.0
-            if price > 0 and short_iv > 0:
-                est_gamma = 0.4 / (price * short_iv * (dte_years ** 0.5))
-        except:
-            est_gamma = 0.0
-
-        # Gamma 风险分档
-        if est_gamma > 0.10: rbd.gamma = +35  # 高危 (如 ONDS)
-        elif est_gamma > 0.05: rbd.gamma = +15
-        elif est_gamma > 0.02: rbd.gamma = +5
+        # --- Risk ---
+        # 复用 Long Gamma 的风险逻辑，因为轻量级 Diagonal 风险特征类似
+        risk = 30
+        if edge_month < 0: risk += 40
         
-        if regime == "BACKWARDATION": rbd.regime = +20
-
-        risk = rbd.base + rbd.dte + rbd.gamma + rbd.regime
-
-        tag = "PMCC"
-        if raw_edge > 0.10: tag += "+" 
+        tag = "DIAG"
+        if edge_month > 0.15: tag += "+"
 
         row = ScanRow(
             symbol=ctx.symbol,
             price=price,
-            short_exp=str(tsf["short_exp"]),
-            short_dte=int(tsf["short_dte"]),
+            short_exp=str(tsf.get("short_exp")),
+            short_dte=int(tsf.get("short_dte", 0)),
             short_iv=short_iv,
-            base_iv=base_iv,
-            edge=float(f"{raw_edge:.2f}"), # 显示真实 Edge
+            base_iv=float(tsf.get("month_iv", 0)),
+            edge=edge_month,
             hv_rank=hv_rank,
-            regime=regime,
-            curvature=str(tsf["curvature"]),
+            regime=str(tsf.get("regime")),
+            curvature=str(tsf.get("curvature")),
             tag=tag,
             cal_score=int(self._clamp(float(score), 0, 100)),
             short_risk=int(self._clamp(float(risk), 0, 100)),
             score_breakdown=bd,
-            risk_breakdown=rbd,
+            risk_breakdown=RiskBreakdown(base=risk),
         )
 
+        # 构建蓝图 (在此处生成，方便 Orchestrator 直接取用)
         if short_strike and long_strike:
-            row.meta = {
-                "strategy": "diagonal",
-                "short_strike": short_strike,
-                "long_exp": long_exp,
-                "long_strike": long_strike,
-                "spread_width": short_strike - long_strike,
-                "est_gamma": float(f"{est_gamma:.4f}") # 方便调试
-            }
+            bp = build_diagonal_blueprint(
+                symbol=ctx.symbol,
+                underlying=price,
+                chain=ctx.raw_chain,
+                short_exp=str(tsf.get("short_exp")),
+                long_exp=long_exp,
+                target_short_strike=short_strike,
+                target_long_strike=long_strike,
+                side="CALL"
+            )
+            row.blueprint = bp
+            
+            # Meta 数据用于前端显示
+            # Meta 数据用于前端显示
+        row.meta = {
+            "strategy": "diagonal",
+            "short_strike": short_strike,
+            "long_exp": long_exp,
+            "long_strike": long_strike,
+            "est_gamma": float(ctx.metrics.gamma) if ctx.metrics else 0.0,
+            
+            # 完整透传 TSF 数据
+            "micro_exp": tsf.get("micro_exp"),
+            "micro_dte": tsf.get("micro_dte"),
+            "micro_iv": tsf.get("micro_iv"),
+            "edge_micro": float(tsf.get("edge_micro", 0)), # <--- 补上了！
+            
+            "month_exp": tsf.get("month_exp"),
+            "month_dte": tsf.get("month_dte"),
+            "month_iv": tsf.get("month_iv"),
+            "edge_month": edge_month,
+        }
             
         return row
 
     def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
         row = self.evaluate(ctx)
         
-        if row.cal_score < min_score or row.short_risk > max_risk:
-            return None, f"Score {row.cal_score} too low or Risk {row.short_risk} too high."
+        if row.cal_score < min_score:
+            return None, "Score too low"
             
-        if not row.meta or "long_strike" not in row.meta:
-             return None, "No valid strike structure found."
-
-        # Extract data from meta
-        s_strike = row.meta["short_strike"]
-        l_strike = row.meta["long_strike"]
-        l_exp = row.meta["long_exp"]
-
-        # Construct concise rationale
-        rationale = (
-            f"PMCC Setup: Buy {l_exp} {l_strike}C (ITM) / Sell {row.short_exp} {s_strike}C (OTM). "
-            f"IV Rank {row.hv_rank:.1f} favors buying LEAPS. {row.regime} aids spread pricing."
-        )
+        if not row.blueprint:
+            return None, "Structure build failed"
 
         rec = Recommendation(
-            strategy=self.name,
+            strategy="DIAGONAL",
             symbol=ctx.symbol,
             action="OPEN DIAGONAL",
-            rationale=rationale,
-            entry_price=ctx.price, # Reference only
+            rationale=f"Tactical Diagonal: Edge {row.edge:.2f}",
+            entry_price=ctx.price,
             score=row.cal_score,
-            conviction="MEDIUM" if row.cal_score < 75 else "HIGH",
+            conviction="HIGH",
             meta=row.meta
         )
-        
         return rec, "OK"
