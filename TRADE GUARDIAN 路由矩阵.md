@@ -149,3 +149,92 @@ LG 要求“前端不能太烂”，否则买了也是磨损：
 
 ---
 
+
+# 🧠 Trade Guardian: Decision Engine Logic
+
+Trade Guardian 采用 **"Shape-First" (形态优先)** 的决策逻辑，将期权期限结构数据转化为具体的战术指令。系统不再单纯依赖绝对波动率数值，而是依赖**相对结构优势**。
+
+### 核心流程
+`Raw Data` $\to$ `Stabilized Edges` $\to$ `Shape Classifier` $\to$ `Strategy Route` $\to$ `Safety Gate` $\to$ `Action`
+
+---
+
+## 1. 核心输入 (Key Inputs)
+
+为了消除短端噪音并还原真实地形，系统在原始数据之上进行了数学稳定化处理：
+
+* **Edge Micro (`em`)**: 前端结构优势。
+    * *Stabilizer V3*: 采用 `1-10 DTE Median Base` 消除单点噪音，并对 `< 6 DTE` 进行连续平滑衰减。
+* **Edge Month (`ek`)**: 后端结构优势。
+    * *Anchor*: 动态锚定 `30-45 DTE` 战术区。
+* **Regime**: 市场状态 (`BACKWARDATION` / `CONTANGO` / `FLAT`).
+* **Momentum**: 15分钟级别 IV 动能 (`PULSE` / `TREND` / `QUIET` / `CRUSH`).
+
+---
+
+## 2. 形态分类矩阵 (Shape Matrix)
+
+系统按 **优先级 (Priority)** 依次识别以下期限结构形态，命中即停止：
+
+| 优先级 | 形态 (Shape) | 判定规则 (伪代码) | 交易含义 |
+| :---: | :--- | :--- | :--- |
+| **1** | **BACKWARD** | `Regime == BACKWARDATION` | **倒挂**。卖方禁区，防御模式。 |
+| **2** | **FFBS** | `ek >= 0.20` & `em < 0.08` | **前平后陡** (Front-Flat Back-Steep)。黄金对角线形态。 |
+| **3** | **SPIKE** | `Squeeze` 或 `em >= 0.12` | **前端刺头**。短期 IV 暴涨，Gamma 风险高。 |
+| **4** | **STEEP** | `ek >= 0.20` | **陡峭**。标准的期限结构套利机会。 |
+| **5** | **MILD** | `0.15 <= ek < 0.20` | **温和**。结构一般，处于临界点。 |
+| **6** | **FLAT** | `ek < 0.15` | **平坦**。无结构优势，纯波动率博弈。 |
+
+---
+
+## 3. 策略路由 (Strategy Route)
+
+基于 **Brain V5 (结构优先，低波兜底)** 哲学：
+
+### 🟢 AUTO-DIAG (Diagonal Strategy)
+**触发逻辑**：当结构优势明显时触发。
+* **适用形态**：`FFBS`, `STEEP`, 或 `edge_month >= 0.20`。
+* **核心思想**：只要坡度够陡，即使绝对 IV 较低，也优先利用时间价值衰减差异（Theta/Vega Arb）获利。
+
+### 🔵 AUTO-LG (Long Gamma / Straddle)
+**触发逻辑**：当结构平庸或波动率极低时触发。
+* **适用形态**：`MILD`, `FLAT`, `BACKWARD`, `SPIKE` (通常), 或 `HV Rank < 30`。
+* **核心思想**：没有结构优势时，买入跨式期权（Straddle）博取波动率回归或方向性突破。
+
+---
+
+## 4. 安全门阀 (Safety Gate V6)
+
+Gate 是系统的最后一道防线，决定最终状态是 `EXEC` (执行)、`LIMIT` (挂单) 还是 `WAIT` (观望)。
+
+### 🛑 Hard Kill (一票否决)
+* **Blueprint Error**: 建仓失败或数据缺失 $\to$ `FORBID`
+* **Gamma Risk**: `est_gamma >= 0.30` $\to$ `FORBID`
+* **Vol Collapse**: `Momentum == CRUSH` $\to$ `FORBID`
+
+### 🚧 Structural Gate (结构放行)
+
+1.  **DIAG 豁免权 (The FFBS Privilege)**:
+    * 若形态为 **`FFBS`** 或 **`STEEP`**，**豁免**对 Micro Edge (`em`) 的最低要求。
+    * *理由：此时前端越平越好，不需要前端有 Edge。*
+
+2.  **SPIKE 降级保护 (Rule #4)**:
+    * 若形态为 **`SPIKE`** 且 `Short DTE <= 7` 且动能不足 (`QUIET`) $\to$ 强制 **`WAIT`**。
+    * *理由：前端挤压时挂 Limit 单容易被动成交并立刻遭受 Gamma 反噬。*
+
+3.  **LG 标准**:
+    * 若 `em` 和 `ek` 双低 (`< Threshold`) $\to$ **`WAIT`**。
+
+### 🚀 Momentum Gate (执行层)
+
+* **`PULSE` / `TREND`**: 动能确立 $\to$ **`EXEC`** (建议 Market 或 Mid+)
+* **`QUIET`**: 动能沉寂 $\to$ **`LIMIT`** (建议 Mid-)
+
+---
+
+## 5. 术语对照表
+
+* **S_IV**: Short Leg IV (Base Denominator)
+* **EdgM**: Micro Edge (Stabilized Front-end Slope)
+* **EdgK**: Month Edge (Stabilized Back-end Slope)
+* **Scr**: Score (综合评分)
