@@ -275,6 +275,7 @@ if __name__ == "__main__":
 ================================================================================
 FILE_PATH: history_viewer.py
 ================================================================================
+import os
 import sqlite3
 import pandas as pd
 import sys
@@ -286,18 +287,20 @@ from colorama import Fore, Style, init
 init(autoreset=True)
 
 class HistoryViewer:
-    def __init__(self, db_path="db/trade_guardian.db"):
-        self.db_path = db_path
+    def __init__(self, db_path=None):
+        if db_path:
+            self.db_path = db_path
+        else:
+            # [FIX] (C) 路径锚定：确保在任何目录运行都指向同一个库
+            root = os.path.dirname(os.path.abspath(__file__))
+            self.db_path = os.path.join(root, "db", "trade_guardian.db")
+
 
     def get_latest_radar(self, symbol=None, limit=20):
-        """
-        锁定最新物理批次，并读取 Tag
-        """
         conn = sqlite3.connect(self.db_path)
         try:
-            # 1. 获取最新的 batch 信息
             batch_res = conn.execute("""
-                SELECT b.batch_id, strftime('%H:%M:%S', b.timestamp), b.market_vix 
+                SELECT b.batch_id, b.timestamp, b.market_vix 
                 FROM scan_batches b
                 JOIN market_snapshots s ON s.batch_id = b.batch_id
                 ORDER BY b.batch_id DESC LIMIT 1
@@ -308,7 +311,10 @@ class HistoryViewer:
             
             latest_id, latest_time, current_vix = batch_res
             
-            # 2. 查询详细数据 (显式查询 p.tag)
+            # [FIX] (F) Symbol 过滤生效
+            filter_sql = "AND s.symbol = ?" if symbol else ""
+            params = [latest_id, symbol, limit] if symbol else [latest_id, limit]
+            
             query = f"""
             SELECT 
                 s.symbol as Sym,
@@ -321,20 +327,23 @@ class HistoryViewer:
                 COALESCE(p.tag, '') as Tag
             FROM market_snapshots s
             LEFT JOIN trade_plans p ON s.snapshot_id = p.snapshot_id
-            WHERE s.batch_id = ?
+            WHERE s.batch_id = ? {filter_sql}
             ORDER BY Score DESC, IV_S DESC
             LIMIT ?
             """
-            df = pd.read_sql_query(query, conn, params=(latest_id, limit))
+            
+            # 这里的 params 必须转换成 tuple 传给 read_sql_query
+            df = pd.read_sql_query(query, conn, params=tuple(params))
             
             if not df.empty:
-                df['Time'] = latest_time
+                df['Time'] = latest_time # (B) 此时已经是 YYYY-MM-DD HH:MM:SS 格式了
                 df['VIX'] = current_vix
                 df = self._process_logic(df, latest_id, conn)
             
             return df
         finally:
             conn.close()
+            
 
     def _process_logic(self, df, latest_id, conn):
         """
@@ -613,20 +622,260 @@ colorama
 
 
 ================================================================================
+FILE_PATH: TRADE GUARDIAN 路由矩阵.md
+================================================================================
+**“Shape × Strategy × Gate” 路由矩阵**（Trade Graduation / Tactical Mode 专用）。
+**先定形态(Shape)** → **再定策略(Route)** → **再定门槛(Gate)** → **最后给执行指令**。
+
+---
+
+# TRADE GUARDIAN 路由矩阵（Brain + Gate 统一版）
+
+## 0) 核心输入（系统只看这几项）
+
+* `em = edge_micro`（前端结构优势）
+* `ek = edge_month`（后端结构优势）
+* `short_dte`（短腿 DTE）
+* `regime`（BACKWARDATION / CONTANGO / FLAT）
+* `is_squeeze`（micro_iv > month_iv * 1.05）
+* `curvature`（SPIKY_FRONT / NORMAL）
+* `momentum`（CRUSH / QUIET / TREND / PULSE）
+* `est_gamma`（风险硬阈值）
+* Blueprint 是否成功（bp.error）
+
+---
+
+## 1) Shape 分类矩阵（先把地形说清楚）
+
+按 **优先级** 从上到下匹配（命中即停止）：
+
+| Priority | Shape        | 判定规则（建议标准）                                               | 交易含义               |
+| -------: | ------------ | -------------------------------------------------------- | ------------------ |
+|        1 | **BACKWARD** | `regime == BACKWARDATION`                                | 倒挂，卖近端=自杀          |
+|        2 | **FFBS**     | `ek >= 0.20 and em < 0.08`                               | 前端平稳、后端陡峭：黄金对角线    |
+|        3 | **SPIKE**    | `is_squeeze == True OR em >= 0.12`（*不要用 curvature 单独触发*） | 前端挤压/事件波：gamma 风险高 |
+|        4 | **STEEP**    | `ek >= 0.20`                                             | 正常后端陡峭，有结构可吃       |
+|        5 | **MILD**     | `0.15 <= ek < 0.20`                                      | 轻度结构，边缘一般          |
+|        6 | **FLAT**     | `ek < 0.15`                                              | 结构平坦，靠纯波动          |
+
+> 备注：你现在输出里 NVDA（ek=0.15）应该更像 **MILD** 而不是 STEEP。
+> SPY 那种 “超短端低IV导致 curvature 虚触发” 不应直接变 SPIKE——SPIKE 必须靠 em / squeeze 确认。
+
+---
+
+## 2) Route（策略路由）矩阵：Shape → 选哪种策略
+
+这部分就是你 Brain V5 的“结构优先”哲学 + 交易员现实：
+
+| Shape        | 默认策略 Route                    | 原因（交易语言）                     |
+| ------------ | ----------------------------- | ---------------------------- |
+| **BACKWARD** | **LG（Long Gamma / Straddle）** | 倒挂时卖近端风险爆炸，只能买 gamma 防守      |
+| **FFBS**     | **DIAG（Diagonal）**            | 前端低IV + 后端高溢价，Theta/Vega 差最肥 |
+| **STEEP**    | **DIAG 优先**（若构建失败→LG）         | 有结构可收割，且前端未必危险               |
+| **SPIKE**    | **LG 优先**（特殊情况才 DIAG）         | 前端挤压，短腿 gamma 反噬概率高          |
+| **MILD**     | **LG 优先**（除非 ek 很稳/你想加条件）     | 结构边缘，做 DIAG 性价比一般            |
+| **FLAT**     | **LG**                        | 没结构就赌波动扩张                    |
+
+**补充：DIAG 构建失败兜底**
+
+* `if diagonal.evaluate(ctx) 失败 or meta缺 long_strike` → 自动回落 **LG**
+  （你已经做了）
+
+---
+
+## 3) Gate（放行矩阵）：Route + Shape + Momentum → WAIT / LIMIT / EXEC
+
+Gate 是 “能不能做 / 怎么做” 的最后裁判，分三层：
+
+### 3.1 Hard Kill（无条件 FORBID）
+
+| 条件                        | Gate       |
+| ------------------------- | ---------- |
+| `bp is None` 或 `bp.error` | **FORBID** |
+| `est_gamma >= 0.30`       | **FORBID** |
+| `momentum == CRUSH`       | **FORBID** |
+
+---
+
+### 3.2 结构门槛（Soft Gate）
+
+你现在的底线参数：
+
+* `MICRO_MIN = 0.10`
+* `MONTH_MIN = 0.15`
+
+#### A) 对 LG（Long Gamma）
+
+LG 要求“前端不能太烂”，否则买了也是磨损：
+
+| 条件                                  | Gate     |
+| ----------------------------------- | -------- |
+| `em < MICRO_MIN AND ek < MONTH_MIN` | **WAIT** |
+| 其它                                  | 进入动能判定   |
+
+#### B) 对 DIAG（Diagonal）——核心：看 ek，微结构豁免 em
+
+| Shape                   | DIAG 的结构要求                            | Gate        |
+| ----------------------- | ------------------------------------- | ----------- |
+| **FFBS / STEEP**        | `ek >= MONTH_MIN`（豁免 em）              | 进入动能判定      |
+| **其它（FLAT/MILD/SPIKE）** | `ek >= MONTH_MIN AND em >= MICRO_MIN` | 否则 **WAIT** |
+
+---
+
+### 3.3 动能判定（EXEC vs LIMIT）
+
+动能来自你的 15m IV 变化（QUIET/TREND/PULSE）：
+
+| Momentum          | Gate      | 执行含义        |
+| ----------------- | --------- | ----------- |
+| **PULSE / TREND** | **EXEC**  | 动能确立：可以主动成交 |
+| **QUIET**         | **LIMIT** | 等触发：挂单潜伏    |
+
+---
+
+## 4) 最重要的“交易员补丁”：SPIKE 的 DIAG 降级规则（强烈建议）
+
+因为 SPIKE 是最容易把你炸掉的形态。
+
+### 规则（推荐最小补丁）
+
+* 如果 `tag` 是 DIAG 且 `shape == SPIKE` 且 `short_dte <= 7` 且 `momentum == QUIET`
+  → **强制 WAIT**（不允许 LIMIT 被动吃 gamma 风险）
+
+| 条件                                    | Gate               |
+| ------------------------------------- | ------------------ |
+| `DIAG & SPIKE & short_dte<=7 & QUIET` | **WAIT**           |
+| `DIAG & SPIKE & (TREND/PULSE)`        | **EXEC**（只有动能确认才打） |
+
+这条会让 TSLA/QQQ/TQQQ 这种 “结构好但前端不安稳” 不会天天 LIMIT。
+
+---
+
+# 最终总表（你可以贴 README 的“决策总矩阵”）
+
+按实际执行顺序：
+
+1. **Hard Kill**：bp/error, gamma, CRUSH → FORBID
+2. **Shape**：BACKWARD / FFBS / SPIKE / STEEP / MILD / FLAT
+3. **Route**：BACKWARD→LG；FFBS/STEEP→DIAG；SPIKE/MILD/FLAT→LG（SPIKE 特判）
+4. **Gate-结构**：DIAG 看 ek（FFBS/STEEP 豁免 em）；LG 看 em/ek 双低
+5. **Gate-动能**：TREND/PULSE→EXEC；QUIET→LIMIT
+6. **SPIKE-DIAG 降级补丁**：SPIKE + DIAG + short_dte<=7 + QUIET → WAIT
+
+---
+
+## 快速 sanity check（用你当前输出验证）
+
+* **IWM：FFBS + ek=0.24 + em=0.01**
+  → Route=DIAG，Gate 不查 em（豁免）→ QUIET → LIMIT ✅
+* **SPY：超短端低IV，但 em 低、ek=0.17（MILD）**
+  → Route=LG → em/ek 是否双低？不双低 → QUIET → LIMIT（但你也可以让 MILD 默认 WAIT）
+* **TSLA：SPIKE + DIAG + QUIET + short_dte=6**
+  → 会被“SPIKE-DIAG 降级补丁”打回 WAIT（避免挂单被动吃风险）✅
+
+---
+
+
+# 🧠 Trade Guardian: Decision Engine Logic
+
+Trade Guardian 采用 **"Shape-First" (形态优先)** 的决策逻辑，将期权期限结构数据转化为具体的战术指令。系统不再单纯依赖绝对波动率数值，而是依赖**相对结构优势**。
+
+### 核心流程
+`Raw Data` $\to$ `Stabilized Edges` $\to$ `Shape Classifier` $\to$ `Strategy Route` $\to$ `Safety Gate` $\to$ `Action`
+
+---
+
+## 1. 核心输入 (Key Inputs)
+
+为了消除短端噪音并还原真实地形，系统在原始数据之上进行了数学稳定化处理：
+
+* **Edge Micro (`em`)**: 前端结构优势。
+    * *Stabilizer V3*: 采用 `1-10 DTE Median Base` 消除单点噪音，并对 `< 6 DTE` 进行连续平滑衰减。
+* **Edge Month (`ek`)**: 后端结构优势。
+    * *Anchor*: 动态锚定 `30-45 DTE` 战术区。
+* **Regime**: 市场状态 (`BACKWARDATION` / `CONTANGO` / `FLAT`).
+* **Momentum**: 15分钟级别 IV 动能 (`PULSE` / `TREND` / `QUIET` / `CRUSH`).
+
+---
+
+## 2. 形态分类矩阵 (Shape Matrix)
+
+系统按 **优先级 (Priority)** 依次识别以下期限结构形态，命中即停止：
+
+| 优先级 | 形态 (Shape) | 判定规则 (伪代码) | 交易含义 |
+| :---: | :--- | :--- | :--- |
+| **1** | **BACKWARD** | `Regime == BACKWARDATION` | **倒挂**。卖方禁区，防御模式。 |
+| **2** | **FFBS** | `ek >= 0.20` & `em < 0.08` | **前平后陡** (Front-Flat Back-Steep)。黄金对角线形态。 |
+| **3** | **SPIKE** | `Squeeze` 或 `em >= 0.12` | **前端刺头**。短期 IV 暴涨，Gamma 风险高。 |
+| **4** | **STEEP** | `ek >= 0.20` | **陡峭**。标准的期限结构套利机会。 |
+| **5** | **MILD** | `0.15 <= ek < 0.20` | **温和**。结构一般，处于临界点。 |
+| **6** | **FLAT** | `ek < 0.15` | **平坦**。无结构优势，纯波动率博弈。 |
+
+---
+
+## 3. 策略路由 (Strategy Route)
+
+基于 **Brain V5 (结构优先，低波兜底)** 哲学：
+
+### 🟢 AUTO-DIAG (Diagonal Strategy)
+**触发逻辑**：当结构优势明显时触发。
+* **适用形态**：`FFBS`, `STEEP`, 或 `edge_month >= 0.20`。
+* **核心思想**：只要坡度够陡，即使绝对 IV 较低，也优先利用时间价值衰减差异（Theta/Vega Arb）获利。
+
+### 🔵 AUTO-LG (Long Gamma / Straddle)
+**触发逻辑**：当结构平庸或波动率极低时触发。
+* **适用形态**：`MILD`, `FLAT`, `BACKWARD`, `SPIKE` (通常), 或 `HV Rank < 30`。
+* **核心思想**：没有结构优势时，买入跨式期权（Straddle）博取波动率回归或方向性突破。
+
+---
+
+## 4. 安全门阀 (Safety Gate V6)
+
+Gate 是系统的最后一道防线，决定最终状态是 `EXEC` (执行)、`LIMIT` (挂单) 还是 `WAIT` (观望)。
+
+### 🛑 Hard Kill (一票否决)
+* **Blueprint Error**: 建仓失败或数据缺失 $\to$ `FORBID`
+* **Gamma Risk**: `est_gamma >= 0.30` $\to$ `FORBID`
+* **Vol Collapse**: `Momentum == CRUSH` $\to$ `FORBID`
+
+### 🚧 Structural Gate (结构放行)
+
+1.  **DIAG 豁免权 (The FFBS Privilege)**:
+    * 若形态为 **`FFBS`** 或 **`STEEP`**，**豁免**对 Micro Edge (`em`) 的最低要求。
+    * *理由：此时前端越平越好，不需要前端有 Edge。*
+
+2.  **SPIKE 降级保护 (Rule #4)**:
+    * 若形态为 **`SPIKE`** 且 `Short DTE <= 7` 且动能不足 (`QUIET`) $\to$ 强制 **`WAIT`**。
+    * *理由：前端挤压时挂 Limit 单容易被动成交并立刻遭受 Gamma 反噬。*
+
+3.  **LG 标准**:
+    * 若 `em` 和 `ek` 双低 (`< Threshold`) $\to$ **`WAIT`**。
+
+### 🚀 Momentum Gate (执行层)
+
+* **`PULSE` / `TREND`**: 动能确立 $\to$ **`EXEC`** (建议 Market 或 Mid+)
+* **`QUIET`**: 动能沉寂 $\to$ **`LIMIT`** (建议 Mid-)
+
+---
+
+## 5. 术语对照表
+
+* **S_IV**: Short Leg IV (Base Denominator)
+* **EdgM**: Micro Edge (Stabilized Front-end Slope)
+* **EdgK**: Month Edge (Stabilized Back-end Slope)
+* **Scr**: Score (综合评分)
+
+================================================================================
 FILE_PATH: config\config.json
 ================================================================================
 {
-  "runtime": {
-    "autogen_config_if_missing": true
-  },
   "paths": {
-    "tickers_csv": "./data/tickers.csv",
-    "cache_dir": "./cache"
+    "tickers_csv": "data/tickers.csv",
+    "cache_dir": "cache"
   },
   "scan": {
-    "contract_type": "CALL",
     "throttle_sec": 0.5,
-    "days_default": 600
+    "contract_type": "ALL"
   },
   "rules": {
     "min_edge_short_base": 1.05
@@ -634,7 +883,20 @@ FILE_PATH: config\config.json
   "policy": {
     "base_rank": 1,
     "min_dte": 3,
-    "max_probe_rank": 3
+    "probe_count": 3
+  },
+  "strategies": {
+    "hv_calendar": {
+      "hv_rules": {
+        "hv_low_rank": 20.0,
+        "hv_mid_rank": 50.0,
+        "hv_high_rank": 70.0,
+        "hv_low_bonus": 10,
+        "hv_mid_bonus": 4,
+        "hv_high_penalty": -4,
+        "hv_extreme_penalty": -10
+      }
+    }
   }
 }
 
@@ -834,11 +1096,15 @@ import os
 import sys
 import time
 import pandas as pd
+import traceback
 from typing import List, Tuple, Optional, Any
 from colorama import Fore, Style
 
 from trade_guardian.domain.models import Context, ScanRow, Blueprint, OrderLeg
 from trade_guardian.app.persistence import PersistenceManager
+from trade_guardian.strategies.blueprint import build_straddle_blueprint 
+# [FIX] 引入限流器
+from trade_guardian.infra.rate_limit import RateLimiter
 
 # --- [交易员底线参数] ---
 MICRO_MIN = 0.10
@@ -850,21 +1116,38 @@ class TradeGuardian:
         self.cfg = cfg
         self.policy = policy
         self.strategy = strategy 
-        self.tickers_path = os.path.join("data", "tickers.csv")
+        
+        # [FIX] P0-2: 从 Config 读取路径，不再硬编码
+        self.tickers_path = cfg.get("paths", {}).get("tickers_csv", "data/tickers.csv")
+        
+        # [FIX] Part 2, Item 5: 初始化限流器
+        throttle = float(cfg.get("scan", {}).get("throttle_sec", 0.5))
+        self.limiter = RateLimiter(throttle)
+        
         self.db = PersistenceManager()
         self.last_batch_df: Optional[pd.DataFrame] = None 
 
     def _get_universe(self) -> List[str]:
         if not os.path.exists(self.tickers_path):
-            print(f"\n❌ [CRITICAL ERROR] Tickers file NOT FOUND")
-            sys.exit(1)
+            # 尝试 fallback 到相对路径
+            fallback = os.path.join("data", "tickers.csv")
+            if os.path.exists(fallback):
+                self.tickers_path = fallback
+            else:
+                print(f"\n❌ [CRITICAL ERROR] Tickers file NOT FOUND at {self.tickers_path}")
+                sys.exit(1)
+                
         df = pd.read_csv(self.tickers_path, header=None)
+        # 简单的清洗
         return df[0].dropna().apply(lambda x: str(x).strip().upper()).tolist()
 
     def scanlist(self, strategy_name: str = "auto", days: int = 600, 
                  min_score: int = 60, max_risk: int = 70, detail: bool = False,
                  limit: int = None, **kwargs):
         
+        # [FIX] Issue B: 开始计时
+        start_ts = time.time()
+
         try:
             vix_q = self.client.get_quote("$VIX")
             current_vix = vix_q.get("lastPrice", 0.0) 
@@ -874,75 +1157,106 @@ class TradeGuardian:
         if limit: tickers = tickers[:limit]
 
         db_results_pack = []  
-        all_rows_for_stats = [] 
-        current_rows_for_next_batch = [] 
         strict_results = [] 
+        current_rows_for_next_batch = [] 
         
-        # ✅ 最终对齐修复：增加间距，单独处理颜色列的宽度
-        FMT = "{sym:<5} {px:<7} {sexp:<11} {sdte:<3} {siv:>6} | {mexp:<11} {mdte:<3} {miv:>6} {em:>5} | {kexp:<11} {kdte:<3} {kiv:>6} {ek:>5} | {sc:>4} {dna:<6} {gate:<6}   {tag:<8}"
+        # DNA -> Shape (Display Structure Shape)
+        FMT = "{sym:<5} {px:<7} {sexp:<11} {sdte:<3} {siv:>6} | {mexp:<11} {mdte:<3} {miv:>6} {em:>5} | {kexp:<11} {kdte:<3} {kiv:>6} {ek:>5} | {sc:>4} {shp:<8} {gate:<6}   {tag:<8}"
         
         HEADER = FMT.format(
             sym="Sym", px="Px", sexp="ShortExp", sdte="D", siv="S_IV",
             mexp="MicroExp", mdte="D", miv="M_IV", em="EdgM",
             kexp="MonthExp", kdte="D", kiv="K_IV", ek="EdgK",
-            sc="Scr", dna="DNA", gate="Gate", tag="Tag"
+            sc="Scr", shp="Shape", gate="Gate", tag="Tag"
         )
         WIDTH = len(HEADER)
 
         print("\n" + "=" * WIDTH)
-        print(f"🧠 TRADE GUARDIAN :: GRADUATION BUILD | VIX: {current_vix:.2f}")
+        print(f"🧠 TRADE GUARDIAN :: GRADUATION BUILD | VIX: {current_vix:.2f} | Strategy: {strategy_name}")
         print("-" * WIDTH)
         print(HEADER)
         print("-" * WIDTH)
 
         for ticker in tickers:
+            # [FIX] Part 2, Item 5: 循环内限流
+            self.limiter.sleep()
+
             try:
+                # 1. 构建上下文
                 ctx = self.client.build_context(ticker, days=days)
                 if not ctx: continue
                 
-                strategy = self._load_strategy("long_gamma")
-                row = strategy.evaluate(ctx)
+                # 2. 策略路由
+                # [FIX] P0-2: 优先使用传入的 strategy 对象，否则根据名称加载
+                current_strategy = self.strategy if self.strategy else self._load_strategy(strategy_name)
+                row = current_strategy.evaluate(ctx)
                 if not row: continue
 
-                # 动能计算
+                # 3. 动能计算 (Momentum)
                 iv_diff = 0.0
                 if self.last_batch_df is not None:
                     prev = self.last_batch_df[self.last_batch_df['symbol'] == row.symbol]
                     if not prev.empty:
+                        # 这里的比较非常基础，后续可以改为 % change
                         iv_diff = row.short_iv - prev.iloc[0]['iv']
                 
-                dna_type = "QUIET"
-                if iv_diff > 2.0: dna_type = "PULSE"
-                elif iv_diff > 0.5: dna_type = "TREND"
-                elif iv_diff < -1.0: dna_type = "CRUSH"
-
+                mom_type = "QUIET"
+                if iv_diff > 2.0: mom_type = "PULSE"
+                elif iv_diff > 0.5: mom_type = "TREND"
+                elif iv_diff < -1.0: mom_type = "CRUSH"
+                
                 row.meta["delta_15m"] = iv_diff
-                bp = self.plan(ctx, row)
-                gate = self._get_gate_status(row, bp, dna_type) 
+                row.meta["momentum"] = mom_type
+
+                # 4. 形态分类 (Shape Classifier) - [FIX] P0-3: 严格对齐路由矩阵
+                tsf = ctx.tsf or {}
+                regime = str(tsf.get("regime", "FLAT"))
+                is_squeeze = bool(tsf.get("is_squeeze", False))
+                # curvature = str(tsf.get("curvature", "NORMAL")) # 矩阵说不要单看这个
+                
+                em = float(row.meta.get("edge_micro", 0) or 0)
+                ek = float(row.meta.get("edge_month", 0) or 0)
+                
+                shape = "FLAT"
+                if regime == "BACKWARDATION":
+                    shape = "BACKWARD"
+                elif ek >= 0.20 and em < 0.08:
+                    shape = "FFBS" # 黄金对角线
+                elif is_squeeze or em >= 0.12: # [FIX] 矩阵规则：SPIKE 必须靠 em 或 squeeze
+                    shape = "SPIKE"
+                elif ek >= 0.20: # [FIX] 矩阵规则：STEEP >= 0.20
+                    shape = "STEEP"
+                elif 0.15 <= ek < 0.20: # [FIX] 矩阵规则：MILD 区间
+                    shape = "MILD"
+                else:
+                    shape = "FLAT"
+                
+                row.meta["shape"] = shape
+                
+                # 5. 获取蓝图
+                bp = getattr(row, 'blueprint', None)
+                if not bp:
+                    bp = self.plan(ctx, row) 
+                
+                # 6. 风控门槛 (Gate V6)
+                gate = self._get_gate_status(row, bp, mom_type) 
                 
                 db_results_pack.append((row, ctx, bp, gate)) 
-                all_rows_for_stats.append(row)
                 current_rows_for_next_batch.append({'symbol': row.symbol, 'iv': row.short_iv})
                 
                 if gate != "FORBID":
-                    strict_results.append((row, ctx, bp, gate, dna_type))
+                    strict_results.append((row, ctx, bp, gate, mom_type))
 
-                # 颜色逻辑
+                # 7. 打印
                 if gate == "EXEC": g_color = Fore.GREEN
                 elif gate == "LIMIT": g_color = Fore.CYAN
                 elif gate == "FORBID": g_color = Fore.RED
                 else: g_color = Fore.YELLOW
                 
-                # ✅ 核心修复：先手动填充空格，再上色，确保视觉宽度一致
-                # 将 Gate 强制填充到 6 字符宽，然后再包颜色代码
-                gate_padded = f"{gate:<6}"
-                gate_display = f"{g_color}{gate_padded}{Style.RESET_ALL}"
+                gate_display = f"{g_color}{gate:<6}{Style.RESET_ALL}"
                 
-                # 数据提取
-                m_iv_val = row.meta.get('micro_iv', 0) or 0
-                k_iv_val = row.meta.get('month_iv', 0) or 0
-                em_val = row.meta.get('edge_micro', 0) or 0
-                ek_val = row.meta.get('edge_month', 0) or 0
+                # Tag 可能为空的处理
+                tag_str = str(row.tag) if row.tag else ""
 
                 print(FMT.format(
                     sym=row.symbol,
@@ -950,28 +1264,51 @@ class TradeGuardian:
                     sexp=row.short_exp,
                     sdte=row.short_dte,
                     siv=f"{int(row.short_iv)}%",
-                    
                     mexp=str(row.meta.get("micro_exp", "N/A")),
                     mdte=str(row.meta.get("micro_dte", 0)),
-                    miv=f"{int(m_iv_val)}%",
-                    em=f"{em_val:.2f}",
-                    
+                    miv=f"{int(row.meta.get('micro_iv', 0))}%",
+                    em=f"{em:.2f}",
                     kexp=str(row.meta.get("month_exp", "N/A")),
                     kdte=str(row.meta.get("month_dte", 0)),
-                    kiv=f"{int(k_iv_val)}%",
-                    ek=f"{ek_val:.2f}",
-                    
+                    kiv=f"{int(row.meta.get('month_iv', 0))}%",
+                    ek=f"{ek:.2f}",
                     sc=row.cal_score,
-                    dna=dna_type,
-                    gate=gate_display, # 使用修复后的 Gate 显示
-                    tag=row.tag
+                    shp=shape, 
+                    gate=gate_display, 
+                    tag=tag_str
                 ))
 
             except Exception as e:
+                print(f"❌ CRASH on {ticker}: {e}")
+                # traceback.print_exc() 
                 continue
 
-        self.last_batch_df = pd.DataFrame(current_rows_for_next_batch)
-        self.db.save_scan_session(strategy_name, current_vix, len(tickers), 0.0, 0.0, 0.0, db_results_pack)
+        # [FIX] (A) 核心修复：更新 last_batch_df，否则动能(Momentum)永远算不出来
+        if current_rows_for_next_batch:
+            self.last_batch_df = pd.DataFrame(current_rows_for_next_batch)
+        
+        # 计算统计指标 (保持你之前的统计逻辑)
+        elapsed = time.time() - start_ts
+        valid_rows = [item[0] for item in db_results_pack]
+        avg_abs_edge = 0.0
+        cheap_vol_pct = 0.0
+        
+        if valid_rows:
+            total_abs_edge = sum(abs(r.edge) for r in valid_rows)
+            avg_abs_edge = total_abs_edge / len(valid_rows)
+            cheap_count = sum(1 for r in valid_rows if r.edge > 0)
+            cheap_vol_pct = cheap_count / len(valid_rows)
+
+        # 保存会话
+        self.db.save_scan_session(
+            strategy_name, 
+            current_vix, 
+            len(tickers), 
+            avg_abs_edge, 
+            cheap_vol_pct, 
+            elapsed, 
+            db_results_pack
+        )
         
         if detail and strict_results:
             print(f"\n🚀 Actionable Blueprints (Tactical Mode)")
@@ -983,73 +1320,100 @@ class TradeGuardian:
     def _get_gate_status(self, row: ScanRow, bp: Optional[Blueprint], dna_type: str) -> str:
         est_gamma = row.meta.get("est_gamma", 0.0)
         
-        # 1. 绝对风控
-        if not bp or bp.error or est_gamma >= 0.25: return "FORBID"
+        # --- Layer 1: Hard Kill (绝对风控) ---
+        if not bp or bp.error: return "FORBID"
+        if est_gamma >= 0.30: return "FORBID" 
         if dna_type == "CRUSH": return "FORBID" 
         
         em = row.meta.get("edge_micro", 0)
         ek = row.meta.get("edge_month", 0)
+        shape = row.meta.get("shape", "FLAT")
+        tag = row.tag or ""
+        short_dte = row.short_dte
         
-        # 2. 结构门槛
-        if em < MICRO_MIN or ek < MONTH_MIN:
-            return "WAIT"
+        # --- Layer 2: Strategy & Shape Gate (结构门槛) ---
+        
+        if "DIAG" in tag:
+            # [DIAG 核心] 看后端结构 (ek)
+            if ek < MONTH_MIN:
+                return "WAIT"
+            
+            # [形态特判]
+            # A. FFBS / STEEP: 完美形态，豁免前端微结构要求 (em)
+            if shape in ["FFBS", "STEEP"]:
+                pass 
+            
+            # B. SPIKE: 前端挤压，风险极高 -> 降级保护 (Rule #4)
+            elif shape == "SPIKE":
+                if short_dte <= 7 and dna_type == "QUIET":
+                    return "WAIT"
+                # 如果是 SPIKE 但 em 极差 (理论上 SPIKE em 应该高，这里是兜底)
+                if em < MICRO_MIN:
+                    return "WAIT"
 
-        # 3. 结构达标
+            # C. 其他形态 (FLAT/MILD): 必须双边达标
+            else:
+                if em < MICRO_MIN:
+                    return "WAIT"
+
+        else:
+            # [LG 核心] 前端不能太烂，或者纯博低波
+            # 如果 em 和 ek 双低，且没有特殊原因，WAIT
+            if em < MICRO_MIN and ek < MONTH_MIN:
+                return "WAIT"
+
+        # --- Layer 3: Momentum Gate (动能执行) ---
         if dna_type in ["PULSE", "TREND"]:
             return "EXEC"
         else:
             return "LIMIT"
+        
 
     def plan(self, ctx: Context, row: ScanRow) -> Optional[Blueprint]:
-        symbol = ctx.symbol
-        atm_strike = row.meta.get("strike", round(row.price, 1))
-        target_exp_key = f"{row.short_exp}:{row.short_dte}"
-        est_debit = -999999.99
-        
-        try:
-            call_map = ctx.raw_chain.get("callExpDateMap", {})
-            put_map = ctx.raw_chain.get("putExpDateMap", {})
-            strike_key = f"{float(atm_strike):g}"
-            
-            if strike_key not in call_map.get(target_exp_key, {}):
-                keys = sorted([float(k) for k in call_map.get(target_exp_key, {}).keys()])
-                if keys: strike_key = f"{min(keys, key=lambda x: abs(x - atm_strike)):g}"
-
-            c_strikes = call_map.get(target_exp_key, {})
-            p_strikes = put_map.get(target_exp_key, {})
-            
-            if strike_key in c_strikes and strike_key in p_strikes:
-                c_c = c_strikes[strike_key][0]
-                p_c = p_strikes[strike_key][0]
-                call_price = (float(c_c.get("bid", 0)) + float(c_c.get("ask", 0))) / 2.0
-                put_price = (float(p_c.get("bid", 0)) + float(p_c.get("ask", 0))) / 2.0
-                if call_price > 0 and put_price > 0:
-                    est_debit = call_price + put_price
-        except: pass
-
-        legs = [OrderLeg(symbol, "BUY", 1, row.short_exp, float(atm_strike), "CALL"), 
-                OrderLeg(symbol, "BUY", 1, row.short_exp, float(atm_strike), "PUT")]
-        return Blueprint(symbol, "STRADDLE", legs, round(est_debit, 2), "Gamma Plan")
+        bp = build_straddle_blueprint(
+            symbol=ctx.symbol,
+            underlying=ctx.price,
+            chain=ctx.raw_chain,
+            exp=row.short_exp
+        )
+        if bp:
+            bp.note = "Fallback Gamma Plan"
+            return bp
+        return Blueprint(ctx.symbol, "STRADDLE", [], 0.0, "Build Failed", error="No Pricing Data")
 
     def _print_enhanced_blueprint(self, bp: Blueprint, row: ScanRow, dna: str, gate: str):
         tactic = ""
         if gate == "LIMIT":
-            tactic = f"{Fore.CYAN}[挂单潜伏] 建议 Limit @ Mid-$0.05 | 触发条件: 等待 DNA 激活{Style.RESET_ALL}"
+            tactic = f"{Fore.CYAN}[挂单潜伏] Limit @ Mid-$0.05 | 等待 DNA 激活{Style.RESET_ALL}"
         elif gate == "EXEC":
-            tactic = f"{Fore.GREEN}[立即执行] 建议 Market 或 Mid+$0.02 | 触发条件: 动能确立{Style.RESET_ALL}"
+            tactic = f"{Fore.GREEN}[立即执行] Market/Mid+$0.02 | 动能确立{Style.RESET_ALL}"
         elif gate == "WAIT":
              tactic = f"{Fore.YELLOW}[保持关注] 尚未达到入场标准{Style.RESET_ALL}"
 
         print(f" {Fore.WHITE}{bp.symbol:<5} | Gate: {gate:<5} | Debit: ${bp.est_debit} | Gamma: {row.meta.get('est_gamma', 0):.4f}")
         print(f"    Edges: Micro {row.meta.get('edge_micro', 0):.2f} / Month {row.meta.get('edge_month', 0):.2f}")
+        
+        shape = row.meta.get("shape", "")
+        mom = row.meta.get("momentum", "QUIET")
+        print(f"    Shape: {shape:<8} | Momentum: {mom}")
+        
+        if "DIAG" in (row.tag or "") and shape == "FFBS":
+            print(f"    ✅ {Fore.GREEN}FFBS (Front-Flat Back-Steep): 完美对角线形态，前端安稳，后端高溢价。{Style.RESET_ALL}")
+        
         print(f"    👉 {tactic}")
-        for leg in bp.legs:
-            print(f"       {'+' if leg.action == 'BUY' else '-'}{leg.ratio} {leg.exp} {leg.strike:<6} {leg.type}")
+        
+        if bp.legs:
+            for leg in bp.legs:
+                action_sym = '+' if leg.action == 'BUY' else '-'
+                print(f"       {action_sym}{leg.ratio} {leg.exp} {leg.strike:<6} {leg.type}")
+        else:
+            print(f"       [ERROR] No Legs: {bp.error}")
         print(f"    {'='*80}")
 
     def _load_strategy(self, name: str):
-        from trade_guardian.strategies.long_gamma import LongGammaStrategy
-        return LongGammaStrategy(self.cfg, self.policy)
+        # [FIX] 如果需要动态加载，这里使用 Registry 会更好，但暂时保持原样以最小化改动
+        from trade_guardian.strategies.auto import AutoStrategy
+        return AutoStrategy(self.cfg, self.policy)
 
 ================================================================================
 FILE_PATH: src\trade_guardian\app\persistence.py
@@ -1059,68 +1423,62 @@ import os
 from datetime import datetime
 
 class PersistenceManager:
-    def __init__(self, db_path="db/trade_guardian.db"):
-        self.db_path = db_path
-        # 数据库结构完全由用户的 create_tg_db.py 掌控，这里不再干涉
-        if not os.path.exists(self.db_path):
-             print(f"⚠️ Warning: DB not found at {self.db_path}. Please ensure create_tg_db.py has been run.")
+    def __init__(self, db_path=None):
+        # [FIX] (C) 路径锚定：无论在哪里运行，都定位到项目根目录下的 db 文件夹
+        if db_path:
+            self.db_path = db_path
+        else:
+            # 当前文件在 src/trade_guardian/app/
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            # 回退 3 层到项目根目录 (src/trade_guardian/app -> src/trade_guardian -> src -> root)
+            project_root = os.path.abspath(os.path.join(base_dir, "..", "..", ".."))
+            self.db_path = os.path.join(project_root, "db", "trade_guardian.db")
 
-    def save_scan_session(self, strategy_name, vix, count, _u1, _u2, _u3, results_pack):
+        # 确保存放目录存在
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+
+
+    # [FIX] Issue B: 接收统计参数 (avg_edge, cheap_vol, elapsed)
+    def save_scan_session(self, strategy_name, vix, count, avg_edge, cheap_vol, elapsed, results_pack):
         """保存单次扫描的所有结果"""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         
         try:
-            # 1. 创建批次
-            # 对应 DB 字段: universe_size (不是 ticker_count)
-            current_time = datetime.now().isoformat()
+            # [FIX] (B) 时间格式修复：SQLite 对 ISO 8601 (带T) 支持不好，改用空格分隔
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
             c.execute("""INSERT INTO scan_batches 
-                      (timestamp, strategy_name, market_vix, universe_size) 
-                      VALUES (?, ?, ?, ?)""",
-                      (current_time, strategy_name, vix, count))
+                      (timestamp, strategy_name, market_vix, universe_size, avg_abs_edge, cheap_vol_pct, elapsed_time) 
+                      VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                      (current_time, strategy_name, vix, count, avg_edge, cheap_vol, elapsed))
             batch_id = c.lastrowid
             
-            # 2. 插入详情
             for item in results_pack:
                 row, ctx, bp, gate = item
                 
-                # 插入快照
-                # 对应 DB 表: market_snapshots
+                # [FIX] (D) 补全字段：写入 hv_rank 和 regime，防止数据丢失
+                # 注意：这里需要 create_tg_db.py 里 market_snapshots 表结构配合 (你之前的 schema 已经有了)
                 c.execute("""INSERT INTO market_snapshots 
-                          (batch_id, symbol, price, iv_short, iv_base, edge) 
-                          VALUES (?, ?, ?, ?, ?, ?)""",
-                          (batch_id, row.symbol, row.price, row.short_iv, row.base_iv, row.edge))
+                          (batch_id, symbol, price, iv_short, iv_base, edge, hv_rank, regime) 
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (batch_id, row.symbol, row.price, row.short_iv, row.base_iv, row.edge, row.hv_rank, row.regime))
                 snap_id = c.lastrowid
                 
-                # 准备 Plan 数据
-                # [models.py] ScanRow 类明确有 tag 字段，直接读取
                 tag_val = row.tag 
                 est_gamma = row.meta.get("est_gamma", 0.0)
+                est_debit = bp.est_debit if bp else 0.0
+                strat_name = bp.strategy if bp else "NONE"
                 
-                # 蓝图数据处理
-                est_debit = 0.0
-                strat_name = "NONE"
-                
-                if bp:
-                    est_debit = bp.est_debit
-                    # [models.py] Blueprint 类明确字段名为 strategy
-                    strat_name = bp.strategy 
-                
-                # 插入计划
-                # 对应 DB 表: trade_plans
-                # 对应 DB 字段: strategy_type (这是建表时的列名), tag
-                # 注意：trade_plans 表没有 symbol 字段 (通过 snapshot_id 关联)，不要强行写入
                 c.execute("""INSERT INTO trade_plans 
-                          (snapshot_id, strategy_type, cal_score, gate_status, est_debit, total_gamma, tag) 
-                          VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                          (snap_id, strat_name, row.cal_score, gate, est_debit, est_gamma, tag_val))
+                          (snapshot_id, strategy_type, cal_score, short_risk, gate_status, est_debit, total_gamma, tag) 
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (snap_id, strat_name, row.cal_score, row.short_risk, gate, est_debit, est_gamma, tag_val))
                 
             conn.commit()
-            print(f"💾 [DB] Persistent Success. Batch ID: {batch_id}")
+            print(f"💾 [DB] Saved Batch {batch_id}: {count} items | AvgEdge: {avg_edge:.2f} | Time: {elapsed:.1f}s")
             
         except Exception as e:
-            # 打印详细错误，不再掩盖
             import traceback
             traceback.print_exc()
             print(f"❌ [DB Error] Save failed: {e}")
@@ -1437,10 +1795,8 @@ class HVInfo:
     hv_percentile: float = 0.0
     high_52w: float = 0.0
     low_52w: float = 0.0
-    # [Fix] 补全 SchwabClient 需要的状态字段
     status: str = "Success"
     msg: str = ""
-    # [Optional] 如果还需要其他统计字段，可以在此保留
     hv_low: float = 0.0
     hv_high: float = 0.0
     p50: float = 0.0
@@ -1450,8 +1806,8 @@ class HVInfo:
 @dataclass
 class TermPoint:
     """Term Structure Point (用于 term structure 计算)"""
-    exp: str = "" # [Fix] 确保有默认值，对应 date_iso
-    exp_date: str = "" # 兼容旧代码
+    exp: str = "" 
+    exp_date: str = "" 
     dte: int = 0
     iv: float = 0.0
     strike: float = 0.0
@@ -1478,7 +1834,9 @@ class Context:
     hv: IVData
     tsf: dict  # Term Structure Factors
     raw_chain: dict
-    metrics: Any = None # Optional for Greeks
+    metrics: Any = None 
+    # [FIX] P0-1: 增加 term 字段，防止 Calendar 策略报错
+    term: List[TermPoint] = field(default_factory=list) 
 
 @dataclass
 class ScoreBreakdown:
@@ -1516,6 +1874,8 @@ class ScanRow:
     score_breakdown: ScoreBreakdown
     risk_breakdown: RiskBreakdown
     meta: Dict[str, Any] = field(default_factory=dict)
+    # 允许动态挂载 blueprint
+    blueprint: Optional[Blueprint] = None
 
 @dataclass
 class Recommendation:
@@ -1550,6 +1910,13 @@ class Blueprint:
     note: str = ""
     gamma_exposure: float = 0.0
     error: Optional[str] = None
+    # 允许动态挂载 greeks 字典
+    short_greeks: Dict[str, float] = field(default_factory=dict)
+    long_greeks: Dict[str, float] = field(default_factory=dict)
+    greeks: Dict[str, float] = field(default_factory=dict)
+
+    def one_liner(self) -> str:
+        return f"{self.symbol} {self.strategy} | est_debit={self.est_debit}"
 
 ================================================================================
 FILE_PATH: src\trade_guardian\domain\policy.py
@@ -1609,10 +1976,8 @@ class StrategyRegistry:
         if n in ("auto", "smart", "default"):
             return AutoStrategy(self.cfg, self.policy)
         
-
-
-        # 更新报错信息，提示用户支持的新策略
-        raise KeyError(f"Unknown strategy: {name}. Available: calendar, hv_calendar, long_gamma")
+        # [FIX] Minor: 修正报错信息，包含 diagonal 和 auto
+        raise KeyError(f"Unknown strategy: {name}. Available: calendar, hv_calendar, long_gamma, diagonal, auto")
 
 ================================================================================
 FILE_PATH: src\trade_guardian\domain\scoring.py
@@ -2194,18 +2559,17 @@ import pandas as pd
 import traceback
 from datetime import datetime, timedelta, date
 from urllib.parse import quote
-from typing import Optional, Any
+from typing import Optional, Any, List
 
 from trade_guardian.domain.models import Context, IVData, HVInfo, TermPoint
 from trade_guardian.infra.schwab_token_manager import fetch_schwab_token
 
-# --- Helper Functions (定义在类外部) ---
+# --- Helper Functions (物理特征辅助) ---
 def _to_date(iso: str) -> date:
     return datetime.strptime(iso, "%Y-%m-%d").date()
 
 def is_third_friday(d: date) -> bool:
     """判断是否为标准月度期权 (第三个周五)"""
-    # Friday is 4, range 15-21 ensures it's the 3rd Friday
     return d.weekday() == 4 and 15 <= d.day <= 21
 
 def get_series_kind(exp_str: str) -> str:
@@ -2225,8 +2589,10 @@ class SchwabClient:
 
     def build_context(self, symbol: str, days: int = 600) -> Optional[Context]:
         """
-        Orchestrator 调用的标准入口。
-        负责获取 Price, IV, HV, Option Chain 并组装成 Context 对象。
+        [Tactical Refactor] Curve-Driven Context Builder
+        优化目标：在扫描全量地形的基础上，引入战术偏好 (Tactical Bias)
+          1. Micro: 优先捕捉单位时间内的 IV 爆发力 (Front Momentum)
+          2. Month: 在平稳区基础上，惩罚过远的 DTE，锚定 35DTE 战术区
         """
         try:
             # 1. 获取 HV 数据
@@ -2234,118 +2600,174 @@ class SchwabClient:
             if getattr(hv_info, 'status', '') == "Error":
                 hv_info = HVInfo(current_hv=0.0, hv_rank=50.0)
 
-            # 2. 获取 Term Structure 和 Chain
+            # 2. 获取全量期权链
             try:
                 price, term_points, raw_chain = self.scan_atm_term(symbol, days)
             except Exception as e:
-                # print(f"  [Warn] Chain scan failed for {symbol}: {e}")
                 return None
 
-            if not term_points:
+            if not term_points or len(term_points) < 3:
                 return None
 
-            # 3. 分析期限结构 (Term Structure)
+            # 3. 排序
             term_points.sort(key=lambda x: x.dte)
 
-            # --- [Step A: 寻找 Short Leg (目标 1-10 DTE)] ---
+            # =================================================================
+            # 算法 A: 确定 Short Leg (执行腿)
+            # 逻辑：1-10 DTE 中最近的非 0DTE
+            # =================================================================
             short_candidates = [p for p in term_points if 1 <= p.dte <= 10]
             if short_candidates:
-                # 避开 0DTE，选最近的
-                short_point = min(short_candidates, key=lambda x: x.dte if x.dte > 0 else 999)
+                short_point = min(short_candidates, key=lambda x: x.dte)
             else:
                 short_point = term_points[0]
             
-            # 提取 Short 的特征，供后续匹配
             short_kind = get_series_kind(short_point.exp)
-            short_weekday = _to_date(short_point.exp).weekday()
+            short_iv_base = short_point.iv if short_point.iv > 0 else 1.0
 
-            # --- [Step B: 寻找 Micro Base (短期节奏, 强制 > Short)] ---
-            # 目标：寻找比 Short 更远的下一阶合约 (Next Step)
-            # 修正核心：p.dte > short_point.dte
-            micro_target = 10
-            micro_pool = [p for p in term_points if short_point.dte < p.dte <= 21]
-            
+            # =================================================================
+            # 算法 B: 寻找 Micro Anchor (引入前端爆发力评分)
+            # 逻辑：在 1-15 DTE 中，优先找局部波峰；若无，找单位时间 IV 增幅最大的点
+            # =================================================================
+            micro_pool = [p for p in term_points if 1 <= p.dte <= 15]
             micro_point = None
-            if not micro_pool:
-                # 极罕见情况：没有比 Short 更远的合约了，退化为 Short (Edge=0)
-                micro_point = short_point
-            else:
-                # 1. 优先找同 Weekday (日期对日期)
-                micro_best = [p for p in micro_pool if _to_date(p.exp).weekday() == short_weekday]
-                
-                if not micro_best:
-                    # 2. 退回同 Kind (比如都是 Weekly)
-                    micro_best = [p for p in micro_pool if get_series_kind(p.exp) == short_kind]
-                
-                if not micro_best:
-                     # 3. 兜底 (只要比 Short 远就行)
-                     micro_best = micro_pool
 
-                # 在符合条件的池子里，找最接近 micro_target (10) 的
-                micro_point = min(micro_best, key=lambda x: abs(x.dte - micro_target))
+            if len(micro_pool) >= 2:
+                # 1. 优先：寻找局部极大值 (Local Maxima) -> 显性挤压
+                local_maxima = []
+                for i in range(1, len(micro_pool) - 1):
+                    if micro_pool[i].iv > micro_pool[i-1].iv and micro_pool[i].iv > micro_pool[i+1].iv:
+                        local_maxima.append(micro_pool[i])
+                
+                if local_maxima:
+                    micro_point = max(local_maxima, key=lambda x: x.iv)
+                else:
+                    # 2. 兜底：无局部峰值时，寻找 "单位时间爆发力" 最强的点
+                    # 公式：Score = (IV - ShortIV) / sqrt(DTE)
+                    # 避免无脑选最远端，而是选曲线最陡峭的那一段
+                    def _momentum_score(p):
+                        d_eff = max(1, p.dte)
+                        return (p.iv - short_iv_base) / np.sqrt(d_eff)
+                    
+                    micro_point = max(micro_pool, key=_momentum_score)
+            
+            # Fallback
+            if not micro_point or micro_point.dte <= short_point.dte:
+                candidates = [p for p in term_points if p.dte > short_point.dte and p.dte <= 21]
+                if candidates:
+                    micro_point = min(candidates, key=lambda x: abs(x.dte - 10))
+                else:
+                    micro_point = short_point
 
-            # --- [Step C: 寻找 Month Base (结构锚点, 目标 25-50 DTE)] ---
-            month_target = 30
-            month_pool = [p for p in term_points if 25 <= p.dte <= 50]
+            # =================================================================
+            # 算法 C: 寻找 Month Anchor (战术窗口修正)
+            # 逻辑：优先在 25-45 DTE (战术区) 寻找锚点；若无数据，再扩至 25-90 DTE
+            # =================================================================
+            month_pool = [p for p in term_points if 25 <= p.dte <= 45]
+            if len(month_pool) < 3:
+                month_pool = [p for p in term_points if 25 <= p.dte <= 90]
             
             month_point = None
-            if not month_pool:
-                # 兜底全场找最接近 30 的
-                month_point = min(term_points, key=lambda x: abs(x.dte - month_target))
+            
+            # 使用简单的距离+平稳度打分 (保持原逻辑，但池子变了)
+            TARGET_MONTH = 35.0
+            LAMBDA_DIST = 0.35 
+
+            if len(month_pool) >= 3:
+                scored_candidates = []
+                for i in range(1, len(month_pool) - 1):
+                    window = [month_pool[i-1].iv, month_pool[i].iv, month_pool[i+1].iv]
+                    sd = np.std(window)
+                    dist_penalty = abs(month_pool[i].dte - TARGET_MONTH) / TARGET_MONTH
+                    score = sd + (LAMBDA_DIST * dist_penalty)
+                    scored_candidates.append((score, sd, month_pool[i]))
+                
+                scored_candidates.sort(key=lambda x: x[0])
+                top_5 = scored_candidates[:min(5, len(scored_candidates))]
+                
+                # 在优胜组里优先选 Monthly
+                best_monthly = next((p for sc, sd, p in top_5 if get_series_kind(p.exp) == "MONTHLY"), None)
+                month_point = best_monthly if best_monthly else top_5[0][2]
             else:
-                # 1. 优先找同 Kind (主要是 Monthly 对 Monthly)
-                month_best = [p for p in month_pool if get_series_kind(p.exp) == short_kind]
-                
-                if not month_best:
-                    # 2. 兜底全场
-                    month_best = month_pool
-                
-                month_point = min(month_best, key=lambda x: abs(x.dte - month_target))
+                # Fallback
+                fallback_candidates = [p for p in term_points if p.dte >= 20]
+                if fallback_candidates:
+                    month_point = min(fallback_candidates, key=lambda x: abs(x.dte - 30))
+                else:
+                    month_point = term_points[-1]
 
-            # ----------------------------------------
 
-            # 4. 数据计算与组装
+            # =================================================================
+            # 4. 数据组装与 Edge 稳健计算 (Stabilizer V3)
+            # =================================================================
             short_iv = short_point.iv
             micro_iv = micro_point.iv
             month_iv = month_point.iv
+
+            if short_iv <= 0: short_iv = 1.0
+            if month_iv <= 0: month_iv = 1.0
+
+            # 结构判定
+            is_squeeze = True if (micro_iv > month_iv * 1.05) else False
             
-            # 防止除零
-            if micro_iv == 0: micro_iv = short_iv if short_iv > 0 else 1.0
-            if month_iv == 0: month_iv = short_iv if short_iv > 0 else 1.0
+            regime = "FLAT"
+            if short_iv > month_iv * 1.03: regime = "BACKWARDATION"
+            elif month_iv > short_iv * 1.03: regime = "CONTANGO"
 
-            # 5. 组装 TSF：包含双基准全量信息
+            curvature = "NORMAL"
+            if micro_iv > short_iv * 1.10: curvature = "SPIKY_FRONT"
+
+            # [Edge Stabilizer V3]
+            # 1. Short Base (Median): 这里的 Short IV 容易受单日事件影响出现毛刺。
+            #    使用 1-10 DTE 区间的中位数作为更稳健的"短期基准"。
+            short_band = [p.iv for p in term_points if 1 <= p.dte <= 10 and p.iv > 0]
+            short_base = np.median(short_band) if short_band else short_iv
+
+            # 2. Mixed Denominator: 防止分母过小，同时也防止低波环境下 Edge 被过度压缩。
+            #    使用 (Base + Far) / 2 作为分母，并保留 12.0 的硬地板。
+            IV_FLOOR = 12.0
+            denom_micro = max(0.5 * (short_base + micro_iv), IV_FLOOR)
+            denom_month = max(0.5 * (short_base + month_iv), IV_FLOOR)
+            
+            edge_micro_raw = (micro_iv - short_base) / denom_micro
+            edge_month_raw = (month_iv - short_base) / denom_month
+            
+            # 3. Extended Soft Decay: 将衰减范围扩至 6 DTE (周权覆盖区)
+            #    系数从 0.7 起步 (sqrt(1/6)=0.4太狠了，我们设死底线)
+            DECAY_CUTOFF = 6.0
+            stabilizer = 1.0
+            
+            if short_point.dte < DECAY_CUTOFF:
+                # 平滑因子
+                raw_decay = np.sqrt(max(1, short_point.dte) / DECAY_CUTOFF)
+                # 限制范围 [0.7, 1.0]，避免对 1-2 DTE 惩罚过重导致完全不可交易
+                stabilizer = max(0.7, min(1.0, raw_decay))
+                
+                edge_micro_raw *= stabilizer
+                edge_month_raw *= stabilizer
+
+            # [DEBUG] 打印调试信息，验证数值是否合理 (正式版可注释)
+            # print(f"[DBG] {symbol:<5} DTE:{short_point.dte} Base:{short_base:.1f}% M_IV:{month_iv:.1f}% Stab:{stabilizer:.2f} Edge:{edge_month_raw:.2f}")
+
             tsf = {
-                "regime": "NORMAL", # 占位
-                "curvature": "FLAT",
-                
-                # Short Leg Info
-                "short_exp": short_point.exp,
-                "short_dte": short_point.dte,
-                "short_iv": short_iv,
-                "short_kind": short_kind,
+                "regime": regime,
+                "curvature": curvature,
+                "is_squeeze": is_squeeze,
 
-                # Micro Base Info
-                "micro_exp": micro_point.exp,
-                "micro_dte": micro_point.dte,
-                "micro_iv": micro_iv,
-                
-                # Month Base Info
-                "month_exp": month_point.exp,
-                "month_dte": month_point.dte,
-                "month_iv": month_iv,
-                
-                # Pre-calculated Edges (双 Edge)
-                "edge_micro": (micro_iv - short_iv) / short_iv if short_iv > 0 else 0.0,
-                "edge_month": (month_iv - short_iv) / short_iv if short_iv > 0 else 0.0
+                # Anchor Points
+                "short_exp": short_point.exp, "short_dte": short_point.dte, "short_iv": short_point.iv, "short_kind": short_kind,
+                "micro_exp": micro_point.exp, "micro_dte": micro_point.dte, "micro_iv": micro_point.iv,
+                "month_exp": month_point.exp, "month_dte": month_point.dte, "month_iv": month_point.iv,
+
+                # Stabilized Edges
+                "edge_micro": edge_micro_raw,
+                "edge_month": edge_month_raw,
             }
-
-            # 6. 组装 Greeks & Data Assembly
+            
+            # 5. 返回 Context
             iv_data = IVData(
-                rank=hv_info.hv_rank, 
-                percentile=0.0, 
-                current_iv=short_iv, 
-                hv_rank=hv_info.hv_rank, 
-                current_hv=hv_info.current_hv
+                rank=hv_info.hv_rank, percentile=0.0, current_iv=short_iv, 
+                hv_rank=hv_info.hv_rank, current_hv=hv_info.current_hv
             )
             
             class Metrics: pass
@@ -2354,23 +2776,22 @@ class SchwabClient:
             metrics.delta = short_point.delta
             metrics.theta = short_point.theta
 
-            # 7. 返回 Context
+            # [FIX] P0-1: 这里增加了 term=term_points
             return Context(
-                symbol=symbol,
-                price=price,
-                iv=iv_data,
+                symbol=symbol, 
+                price=price, 
+                iv=iv_data, 
                 hv=iv_data, 
-                tsf=tsf,
-                raw_chain=raw_chain,
-                metrics=metrics
+                tsf=tsf, 
+                raw_chain=raw_chain, 
+                metrics=metrics,
+                term=term_points 
             )
-
+        
         except Exception as e:
-            print(f"❌ [Error] build_context critical fail for {symbol}: {e}")
             return None
 
-    # --- 基础 API 方法 ---
-
+    # --- 基础 API 方法保持不变 ---
     def _headers(self):
         token = fetch_schwab_token()
         if not token: raise ValueError("Token fetch failed")
@@ -2409,12 +2830,14 @@ class SchwabClient:
         return resp.json() if resp.status_code == 200 else {}
 
     def scan_atm_term(self, symbol: str, days: int) -> tuple[float, list[TermPoint], dict]:
+        """一次性获取未来 N 天的全量期权链"""
         q = self.get_quote(symbol)
         price = float(q.get("lastPrice") or 0.0)
         if price == 0: raise RuntimeError(f"No price for {symbol}")
 
         from_date = datetime.now().strftime("%Y-%m-%d")
         to_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+        
         chain = self._fetch_calls_chain(symbol, from_date, to_date, range_val="ALL")
         call_map = chain.get("callExpDateMap") or {}
 
@@ -2433,12 +2856,15 @@ class SchwabClient:
                     if iv > 0:
                         if iv < 5.0: iv *= 100.0
                         min_dist, best_strike = dist, s_val
-                        best_data = {"iv": iv, "mark": float(c.get("mark") or 0.0), 
-                                     "delta": float(c.get("delta") or 0.0), 
-                                     "theta": float(c.get("theta") or 0.0), 
-                                     "gamma": float(c.get("gamma") or 0.0)}
+                        best_data = {
+                            "iv": iv, "mark": float(c.get("mark") or 0.0), 
+                            "delta": float(c.get("delta") or 0.0), 
+                            "theta": float(c.get("theta") or 0.0), 
+                            "gamma": float(c.get("gamma") or 0.0)
+                        }
             if best_data:
                 term.append(TermPoint(exp=date_iso, dte=dte, strike=best_strike, **best_data))
+        
         return price, term, chain
 
 ================================================================================
@@ -2597,107 +3023,77 @@ from typing import Optional, Tuple
 from trade_guardian.domain.models import Context, Recommendation, ScanRow
 from trade_guardian.domain.policy import ShortLegPolicy
 from trade_guardian.strategies.base import Strategy
-
-# [关键变更] 导入 Diagonal 而不是 Calendar
 from trade_guardian.strategies.diagonal import DiagonalStrategy
 from trade_guardian.strategies.long_gamma import LongGammaStrategy
 
 
 class AutoStrategy(Strategy):
     """
-    Strategy #5: Auto / Smart Router (Final Version)
-    Analyzes Vol Regime & HV Rank to dispatch to the best sub-strategy.
+    Strategy #5: Auto / Smart Router (Brain V5 - Structure First)
     
-    Sub-Strategies:
-      1. Long Gamma (Straddle): For Low Vol / Contango environments.
-      2. Diagonal (PMCC): For Mid-High Vol / Structural plays.
+    Philosophy:
+      - Structure Trumps Volatility: If the Term Structure offers a good edge (>0.20),
+        we prioritize Diagonal spreads to harvest Theta/Vega differential, even if IV is low.
+      - Low Vol Fallback: Only when structure is flat do we revert to Long Gamma (Straddle)
+        to play for pure expansion.
     
-    Logic:
-      - Low Vol (HV < 35): Force Long Gamma
-      - High Vol (HV > 55) or Backwardation: Force Diagonal
-      - Mid Vol (35 <= HV <= 55): Run BOTH, pick the one with higher Score.
+    Routing Order:
+      1. Backwardation -> LG (Defense)
+      2. Edge > 0.20   -> DIAG (Attack Structure)
+      3. HV < 30       -> LG (Attack Vol Floor)
+      4. Default       -> LG
     """
     name = "auto"
 
     def __init__(self, cfg: dict, policy: ShortLegPolicy):
         self.cfg = cfg
         self.policy = policy
-        # 初始化双核引擎
-        self.diagonal = DiagonalStrategy(cfg, policy)     # 替代了原来的 Calendar
+        self.diagonal = DiagonalStrategy(cfg, policy)
         self.long_gamma = LongGammaStrategy(cfg, policy)
 
     def evaluate(self, ctx: Context) -> ScanRow:
-        """
-        Routing Logic:
-        1. Get HV Rank & Regime
-        2. Decide Strategy (Deterministic or Competitive)
-        3. Delegate evaluate()
-        4. Tag result with AUTO prefix
-        """
         hv_rank = float(ctx.hv.hv_rank)
-        regime = str(ctx.tsf.get("regime", "FLAT"))
+        tsf = ctx.tsf
+        regime = str(tsf.get("regime", "FLAT"))
+        edge_month = float(tsf.get("edge_month", 0.0))
 
-        # --- 决策逻辑 (Brain) ---
+        # --- 决策逻辑 (Brain V5) ---
         
-        # 1. [明确低波动] 且结构健康 -> 倾向 Long Gamma
-        # HV Rank < 35 且非倒挂，适合做多波动率
-        if hv_rank < 35 and regime != "BACKWARDATION":
+        # 1. [倒挂保护] Backwardation -> 强制 Long Gamma
+        # 这种时候卖近端是自杀，必须防守
+        if regime == "BACKWARDATION":
             row = self.long_gamma.evaluate(ctx)
-            # Tag: LG-C -> AUTO-LG-C
-            row.tag = f"AUTO-{row.tag}"
+            row.tag = f"AUTO-LG"
+            return row
+
+        # 2. [结构优先] 只要 Edge 足够好 (> 0.20)，优先做 Diagonal
+        # 即使 HV 很低，优秀的结构也能提供比 Straddle 更好的盈亏比
+        # (包含了 > 0.35 的超级结构情况)
+        if edge_month >= 0.20:
+            row_diag = self.diagonal.evaluate(ctx)
+            # 只有构建成功才返回，否则掉下去走兜底
+            if row_diag and row_diag.meta and "long_strike" in row_diag.meta:
+                row_diag.tag = f"AUTO-DIAG" 
+                return row_diag
+
+        # 3. [低波博弈] 结构平庸，但波动率在地板 -> 强制 Long Gamma
+        # NVDA (Edge 0.16) 会落到这里
+        if hv_rank < 30:
+            row = self.long_gamma.evaluate(ctx)
+            row.tag = f"AUTO-LG" 
             return row
         
-        # 2. [明确高波动] 或 [倒挂] -> 倾向 Diagonal (PMCC)
-        # 此时买 Straddle 太贵，不如用 PMCC 降低成本或观望
-        elif hv_rank > 55 or regime == "BACKWARDATION":
-            row = self.diagonal.evaluate(ctx)
-            # Tag: PMCC-C -> AUTO-PMCC-C
-            row.tag = f"AUTO-{row.tag}"
-            return row
-
-        # 3. [模糊地带 / 竞争区域] 35 <= HV <= 55
-        # 两个策略都跑一遍，谁分高选谁
-        else:
-            res_lg = self.long_gamma.evaluate(ctx)
-            res_diag = self.diagonal.evaluate(ctx)
-
-            # 比较分数 (Score)
-            if res_lg.cal_score >= res_diag.cal_score:
-                # Long Gamma 胜出
-                row = res_lg
-                row.tag = f"AUTO-{row.tag}"
-                return row
-            else:
-                # Diagonal 胜出
-                row = res_diag
-                row.tag = f"AUTO-{row.tag}"
-                return row
+        # 4. [默认兜底] 结构平坦且波动率中等 -> Long Gamma
+        row = self.long_gamma.evaluate(ctx)
+        row.tag = f"AUTO-LG"
+        return row
 
     def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
-        """
-        Recommendation routing logic matches evaluate logic.
-        """
-        hv_rank = float(ctx.hv.hv_rank)
-        regime = str(ctx.tsf.get("regime", "FLAT"))
-
-        # 1. Force Long Gamma
-        if hv_rank < 35 and regime != "BACKWARDATION":
-            return self.long_gamma.recommend(ctx, min_score, max_risk)
-        
-        # 2. Force Diagonal
-        elif hv_rank > 55 or regime == "BACKWARDATION":
+        row = self.evaluate(ctx)
+        if "DIAG" in row.tag:
             return self.diagonal.recommend(ctx, min_score, max_risk)
-        
-        # 3. Competitive
         else:
-            # 复用 evaluate 的结果来决定调用谁
-            row_lg = self.long_gamma.evaluate(ctx)
-            row_diag = self.diagonal.evaluate(ctx)
-
-            if row_lg.cal_score >= row_diag.cal_score:
-                return self.long_gamma.recommend(ctx, min_score, max_risk)
-            else:
-                return self.diagonal.recommend(ctx, min_score, max_risk)
+            return self.long_gamma.recommend(ctx, min_score, max_risk)
 
 ================================================================================
 FILE_PATH: src\trade_guardian\strategies\base.py
@@ -2728,20 +3124,15 @@ class Strategy(ABC):
 ================================================================================
 FILE_PATH: src\trade_guardian\strategies\blueprint.py
 ================================================================================
-from dataclasses import dataclass
 from typing import Optional, Dict, Any
+from trade_guardian.domain.models import Blueprint, OrderLeg
 
-# [辅助函数升级] 尝试提取 Greeks
+# [辅助函数] 保持不变
 def _extract_greeks_for(chain: Dict[str, Any], side: str, exp: str, strike: float) -> Dict[str, float]:
     """尝试从原始数据中提取 Delta/Gamma/Theta"""
-    # 注意：这取决于你的数据源格式。
-    # 假设 chain['callExpDateMap'][exp][strike][0] 里面除了 mark 还有 delta/gamma 等字段
-    # 如果没有，这个函数会返回空字典，不影响程序运行
-    
     side_map_key = "callExpDateMap" if side.upper() == "CALL" else "putExpDateMap"
     exp_map = chain.get(side_map_key, {})
     
-    # 尝试找到对应的 Expiry Key (模糊匹配 "2026-01-02:...")
     target_key = None
     for k in exp_map.keys():
         if k.startswith(exp):
@@ -2751,15 +3142,11 @@ def _extract_greeks_for(chain: Dict[str, Any], side: str, exp: str, strike: floa
     if not target_key: return {}
     
     strikes = exp_map[target_key]
-    # 寻找 Strike (key 是 string)
-    # 浮点数匹配比较麻烦，我们做个简单的转 string 尝试
-    # 或者遍历
     quote = None
     strike_str = f"{strike:.1f}"
     if strike_str in strikes:
         quote = strikes[strike_str][0]
     else:
-        # 尝试 float 匹配
         for s_str, q_list in strikes.items():
             if abs(float(s_str) - strike) < 0.01:
                 quote = q_list[0]
@@ -2774,87 +3161,20 @@ def _extract_greeks_for(chain: Dict[str, Any], side: str, exp: str, strike: floa
     }
 
 def _extract_mid_for(chain: Dict[str, Any], side: str, exp: str, strike: float) -> Optional[float]:
-    # ... (保持原有的 _extract_mid_for 代码不变) ...
-    # 为了完整性，这里简略，请保留你原文件里的逻辑
     side_map = chain.get("callExpDateMap" if side == "CALL" else "putExpDateMap", {})
-    # ... (原有逻辑)
-    # 这里只是占位，实际请不要删除原来的逻辑
     for k in side_map:
         if k.startswith(exp):
             strikes = side_map[k]
             for s_key, quotes in strikes.items():
                 if abs(float(s_key) - strike) < 0.01:
                     q = quotes[0]
-                    # 优先用 mark，没有则用 (bid+ask)/2
                     if "mark" in q: return float(q["mark"])
                     if "bid" in q and "ask" in q: return (float(q["bid"]) + float(q["ask"])) / 2.0
     return None
 
-
-@dataclass
-class CalendarBlueprint:
-    symbol: str
-    strike: float
-    short_exp: str
-    long_exp: str
-    est_debit: Optional[float]
-    note: str
-    # 新增
-    short_greeks: Optional[Dict[str, float]] = None
-    long_greeks: Optional[Dict[str, float]] = None
-
-    def one_liner(self) -> str:
-        debit = f"{self.est_debit:.2f}" if isinstance(self.est_debit, (int, float)) else "N/A"
-        return (
-            f"{self.symbol} CALENDAR  "
-            f"-{self.short_exp} / +{self.long_exp} @ {self.strike:g}  "
-            f"est_debit={debit}"
-        )
-
-@dataclass
-class StraddleBlueprint:
-    symbol: str
-    strike: float
-    exp: str
-    est_debit: Optional[float]
-    note: str
-    # 新增
-    greeks: Optional[Dict[str, float]] = None # ATM 的 Greeks
-
-    def one_liner(self) -> str:
-        debit = f"{self.est_debit:.2f}" if isinstance(self.est_debit, (int, float)) else "N/A"
-        return (
-            f"{self.symbol} STRADDLE  "
-            f"BUY {self.exp} {self.strike:g} CALL/PUT  "
-            f"est_debit={debit}"
-        )
-
-@dataclass
-class DiagonalBlueprint:
-    symbol: str
-    side: str
-    short_exp: str
-    short_strike: float
-    long_exp: str
-    long_strike: float
-    est_debit: Optional[float]
-    width: float
-    max_loss: Optional[float]
-    note: str
-    # 新增
-    short_greeks: Optional[Dict[str, float]] = None
-    long_greeks: Optional[Dict[str, float]] = None
-
-    def one_liner(self) -> str:
-        debit = f"{self.est_debit:.2f}" if isinstance(self.est_debit, (int, float)) else "N/A"
-        return (
-            f"{self.symbol} DIAGONAL({self.side})  "
-            f"BUY {self.long_exp} {self.long_strike:g} / "
-            f"SELL {self.short_exp} {self.short_strike:g}  "
-            f"est_debit={debit}"
-        )
-
-# === 更新 Build 函数 ===
+# =========================================================
+# 核心修改：废弃私有 Blueprint 类，统一返回 domain.models.Blueprint
+# =========================================================
 
 def build_diagonal_blueprint(
     *,
@@ -2866,43 +3186,42 @@ def build_diagonal_blueprint(
     target_short_strike: float,
     target_long_strike: float,
     side: str = "CALL",
-) -> Optional[DiagonalBlueprint]:
+) -> Optional[Blueprint]:
     
     short_mid = _extract_mid_for(chain, side=side, exp=short_exp, strike=target_short_strike)
     long_mid = _extract_mid_for(chain, side=side, exp=long_exp, strike=target_long_strike)
 
-    # [新增] 提取 Greeks
-    short_greeks = _extract_greeks_for(chain, side, short_exp, target_short_strike)
-    long_greeks = _extract_greeks_for(chain, side, long_exp, target_long_strike)
-
-    est_debit = None
+    est_debit = 0.0
+    error_msg = None
     note = ""
     width = abs(target_short_strike - target_long_strike)
 
     if isinstance(short_mid, (int, float)) and isinstance(long_mid, (int, float)):
         est_debit = float(long_mid - short_mid)
         
-        # Hard Filter
+        # 宽容的风控逻辑：只记录 Note，不报错
         if est_debit > width:
-            return None 
+            excess = est_debit - width
+            note = f"⚠️ High Debit (Net Risk: -${excess:.2f}). Vega Play."
         else:
             note = f"Healthy PMCC Setup. Width={width:.2f}"
     else:
-        return None
+        # 价格缺失
+        error_msg = "Missing pricing data"
 
-    return DiagonalBlueprint(
+    # 构造标准 Legs
+    legs = [
+        OrderLeg(symbol=symbol, action="BUY", ratio=1, exp=long_exp, strike=target_long_strike, type=side),
+        OrderLeg(symbol=symbol, action="SELL", ratio=1, exp=short_exp, strike=target_short_strike, type=side)
+    ]
+
+    return Blueprint(
         symbol=symbol,
-        side=side,
-        short_exp=short_exp,
-        short_strike=target_short_strike,
-        long_exp=long_exp,
-        long_strike=target_long_strike,
-        est_debit=est_debit,
-        width=width,
-        max_loss=est_debit,
+        strategy="DIAGONAL",
+        legs=legs,
+        est_debit=round(est_debit, 2),
         note=note,
-        short_greeks=short_greeks,
-        long_greeks=long_greeks
+        error=error_msg
     )
 
 def build_straddle_blueprint(
@@ -2911,17 +3230,10 @@ def build_straddle_blueprint(
     underlying: float,
     chain: Dict[str, Any],
     exp: str,
-) -> Optional[StraddleBlueprint]:
+) -> Optional[Blueprint]:
     
-    # 这里的逻辑稍微简化，我们只取 Call 的 Greeks 做参考
-    # 实际上 Straddle 需要 Call 和 Put 的 Greeks 只有 Gamma 是相加，Delta 是中性
-    
-    # 1. Find ATM strike (保持原有逻辑)
+    # 查找 ATM Strike
     call_map = chain.get("callExpDateMap", {})
-    # ... (省略查找 ATM Strike 逻辑，保持你原有的)
-    # 假设我们找到了 strike
-    
-    # 为了演示，我把原逻辑简化写在这里，你需要保留你原来的 find strike 逻辑
     target_key = None
     for k in call_map:
         if k.startswith(exp):
@@ -2932,24 +3244,24 @@ def build_straddle_blueprint(
     strikes = sorted([float(s) for s in call_map[target_key].keys()])
     strike = min(strikes, key=lambda x: abs(x - underlying))
     
-    # 获取价格
     call_mid = _extract_mid_for(chain, "CALL", exp, strike)
     put_mid = _extract_mid_for(chain, "PUT", exp, strike)
     
-    # [新增] 获取 Greeks
-    atm_greeks = _extract_greeks_for(chain, "CALL", exp, strike)
-    
-    est_debit = None
+    est_debit = 0.0
     if call_mid and put_mid:
         est_debit = call_mid + put_mid
         
-    return StraddleBlueprint(
+    legs = [
+        OrderLeg(symbol=symbol, action="BUY", ratio=1, exp=exp, strike=strike, type="CALL"),
+        OrderLeg(symbol=symbol, action="BUY", ratio=1, exp=exp, strike=strike, type="PUT")
+    ]
+
+    return Blueprint(
         symbol=symbol,
-        strike=strike,
-        exp=exp,
-        est_debit=est_debit,
-        note="ATM strike chosen",
-        greeks=atm_greeks
+        strategy="STRADDLE",
+        legs=legs,
+        est_debit=round(est_debit, 2),
+        note="ATM Straddle"
     )
 
 def build_calendar_blueprint(
@@ -2960,12 +3272,8 @@ def build_calendar_blueprint(
     short_exp: str,
     long_exp: str,
     prefer_side: str = "CALL"
-) -> Optional[CalendarBlueprint]:
+) -> Optional[Blueprint]:
     
-    # ... (保留原有 ATM Strike 查找逻辑)
-    # 假设找到 strike
-    
-    # 模拟查找
     call_map = chain.get("callExpDateMap", {})
     target_key = None
     for k in call_map:
@@ -2979,23 +3287,21 @@ def build_calendar_blueprint(
     short_mid = _extract_mid_for(chain, prefer_side, short_exp, strike)
     long_mid = _extract_mid_for(chain, prefer_side, long_exp, strike)
     
-    # [新增] Greeks
-    short_greeks = _extract_greeks_for(chain, prefer_side, short_exp, strike)
-    long_greeks = _extract_greeks_for(chain, prefer_side, long_exp, strike)
-    
-    est_debit = None
+    est_debit = 0.0
     if short_mid and long_mid:
         est_debit = long_mid - short_mid
         
-    return CalendarBlueprint(
+    legs = [
+        OrderLeg(symbol=symbol, action="BUY", ratio=1, exp=long_exp, strike=strike, type=prefer_side),
+        OrderLeg(symbol=symbol, action="SELL", ratio=1, exp=short_exp, strike=strike, type=prefer_side)
+    ]
+
+    return Blueprint(
         symbol=symbol,
-        strike=strike,
-        short_exp=short_exp,
-        long_exp=long_exp,
-        est_debit=est_debit,
-        note="ATM Calendar",
-        short_greeks=short_greeks,
-        long_greeks=long_greeks
+        strategy="CALENDAR",
+        legs=legs,
+        est_debit=round(est_debit, 2),
+        note="ATM Calendar"
     )
 
 ================================================================================
@@ -3055,8 +3361,6 @@ class CalendarStrategy:
         gamma: continuous penalty based on gamma normalized vs front (or max)
         curvature: continuous penalty based on squeeze_ratio (only when SPIKY_FRONT)
         regime: small penalty (BACKWARDATION > CONTANGO > FLAT)
-
-        We also keep breakdown fields as integers for stable CLI output.
         """
         bd = RiskBreakdown(base=35)
 
@@ -3108,7 +3412,8 @@ class CalendarStrategy:
             #  sr 1.10..1.80 => 0..10
             curv_pen = 10.0 * self._clamp((sr - 1.10) / 0.70, 0.0, 1.0)
 
-        bd.curv = int(round(self._clamp(curv_pen, 0.0, 10.0)))
+        # [FIX] Issue A: 字段名修正为 curvature (原为 curv)
+        bd.curvature = int(round(self._clamp(curv_pen, 0.0, 10.0)))
 
         # -------- Regime penalty (small, not dominating) --------
         # BACKWARDATION means front richer -> short leg can be more dangerous (bigger adverse gamma & gap risk).
@@ -3122,7 +3427,8 @@ class CalendarStrategy:
         # -------- Penalties slot (reserved) --------
         bd.penalties = 0
 
-        total = bd.base + bd.dte + bd.gamma + bd.curv + bd.regime + bd.penalties
+        # [FIX] Issue A: 汇总计算也同步修正
+        total = bd.base + bd.dte + bd.gamma + bd.curvature + bd.regime + bd.penalties
         return int(self._clamp(float(total), 0.0, 100.0)), bd
 
     def evaluate(self, ctx: Context) -> ScanRow:
@@ -3238,7 +3544,7 @@ class CalendarStrategy:
             )
 
             short_gamma = float(p.gamma) if p.gamma is not None else 0.0
-            risk, _ = self._risk_score(
+            risk, rbd = self._risk_score(
                 ctx,
                 short_dte=int(p.dte),
                 short_gamma=short_gamma,
@@ -3251,39 +3557,56 @@ class CalendarStrategy:
 
             tag = self._tag(regime, curvature)
 
-            # first tradable that satisfies thresholds
+            # [FIX] Issue E: Correctly construct Recommendation object with meta dict
             if score >= min_score and risk <= max_risk:
+                meta_data = {
+                    "rank": int(rk),
+                    "exp": str(p.exp),
+                    "dte": int(p.dte),
+                    "iv": float(p.iv),
+                    "tag": tag,
+                    "risk_breakdown": rbd,
+                    "squeeze_ratio": squeeze_ratio
+                }
+                
                 rec = Recommendation(
-                    rec_rank=int(rk),
-                    rec_exp=str(p.exp),
-                    rec_dte=int(p.dte),
-                    rec_iv=float(p.iv),
-                    rec_edge=float(edge),
-                    rec_score=int(score),
-                    rec_risk=int(risk),
-                    rec_tag=tag,
-                    rec_breakdown=bd,
+                    strategy="CALENDAR",
+                    symbol=ctx.symbol,
+                    action="OPEN",
+                    rationale=f"Score {score} > {min_score}",
+                    entry_price=ctx.price,
+                    score=int(score),
+                    conviction="MEDIUM",
+                    meta=meta_data
                 )
                 summary = f"ok rk{rk} {p.exp} d{p.dte} e{edge:.2f} s{score} r{risk} {tag}"
                 return rec, summary
 
-            # track best attempt summary for watchlist
-            if best_attempt is None or score > best_attempt.rec_score:
+            # Track best attempt
+            if best_attempt is None or score > best_attempt.score:
+                meta_data = {
+                    "rank": int(rk),
+                    "exp": str(p.exp),
+                    "dte": int(p.dte),
+                    "iv": float(p.iv),
+                    "tag": tag,
+                    "risk_breakdown": rbd,
+                    "squeeze_ratio": squeeze_ratio
+                }
+                
                 best_attempt = Recommendation(
-                    rec_rank=int(rk),
-                    rec_exp=str(p.exp),
-                    rec_dte=int(p.dte),
-                    rec_iv=float(p.iv),
-                    rec_edge=float(edge),
-                    rec_score=int(score),
-                    rec_risk=int(risk),
-                    rec_tag=tag,
-                    rec_breakdown=bd,
+                    strategy="CALENDAR",
+                    symbol=ctx.symbol,
+                    action="WATCH",
+                    rationale="Best attempt",
+                    entry_price=ctx.price,
+                    score=int(score),
+                    conviction="LOW",
+                    meta=meta_data
                 )
                 best_summary = f"best rk{rk} {p.exp} d{p.dte} e{edge:.2f} s{score} r{risk} {tag}"
 
         return None, best_summary
-
 
 ================================================================================
 FILE_PATH: src\trade_guardian\strategies\diagonal.py
@@ -3301,17 +3624,20 @@ from trade_guardian.domain.models import (
 )
 from trade_guardian.domain.policy import ShortLegPolicy
 from trade_guardian.strategies.base import Strategy
+from trade_guardian.strategies.blueprint import build_diagonal_blueprint
 
 
 class DiagonalStrategy(Strategy):
     """
-    Strategy #6: Diagonal Spread / PMCC (Poor Man's Covered Call)
+    Strategy #6: Tactical Diagonal (Lightweight)
     
     Logic:
-      - Buy Deep ITM LEAPS (Long Term) -> Substitute for Stock (High Delta)
-      - Sell OTM Near Term Call -> Income Generation (High Theta)
-      - Ideal for Bullish Long-term + Neutral/Bullish Short-term
-      - Likes Contango (Long term IV < Short term IV)
+      - Long Leg: Uses the 'Month Anchor' (~30-45 DTE) found by Curve Analysis.
+      - Short Leg: Uses the 'Short Anchor' (1-10 DTE).
+      - Strikes: 
+          Long @ ATM/ITM (High Vega, Low Delta Cost)
+          Short @ OTM (Income)
+      - Goal: Capture Term Structure Edge without the heavy capital of PMCC LEAPS.
     """
     name = "diagonal"
 
@@ -3323,225 +3649,177 @@ class DiagonalStrategy(Strategy):
     def _clamp(x: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, x))
     
-    def _find_strikes(self, ctx: Context, short_exp: str) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+    def _find_strikes(self, ctx: Context) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+        """
+        寻找轻量级 Diagonal 的行权价结构：
+        Long: Month Exp @ First ITM or ATM
+        Short: Short Exp @ First OTM
+        """
         price = ctx.price
         chain = ctx.raw_chain
+        tsf = ctx.tsf
         
-        # ---------------------------------------------------------
-        # 1. 寻找 Short Leg (卖方腿) - Near Term OTM Call
-        # ---------------------------------------------------------
+        # 1. 锁定到期日 (直接复用 Curve 算法的结果)
+        short_exp = tsf.get("short_exp")
+        long_exp = tsf.get("month_exp") # 使用优化过的 35DTE 锚点，不再是 LEAPS
+
+        if not short_exp or not long_exp:
+            return None, None, None
+        
+        # 2. 获取 Strike Map
         call_map = chain.get("callExpDateMap", {})
-        short_strikes_map = None
-        for k in call_map.keys():
-            if k.startswith(short_exp):
-                short_strikes_map = call_map[k]
-                break
         
-        if not short_strikes_map: 
+        # 辅助函数：找特定日期的 strikes
+        def get_strikes_for_exp(exp_date_str):
+            # 模糊匹配日期前缀
+            for k, v in call_map.items():
+                if k.startswith(exp_date_str):
+                    return sorted([float(s) for s in v.keys()])
+            return []
+
+        short_strikes = get_strikes_for_exp(short_exp)
+        long_strikes = get_strikes_for_exp(long_exp)
+
+        if not short_strikes or not long_strikes:
             return None, None, None
 
-        avail_strikes = sorted([float(s) for s in short_strikes_map.keys()])
+        # 3. 选择行权价 (Tactical Light Setup)
         
-        # 找 First OTM，通常保留一点缓冲 (e.g. 1.01% - 1.02%)
-        # [Safety] strictly ensure it is OTM. If price is 100, we want > 101.
-        short_strike = next((s for s in avail_strikes if s > price * 1.015), None)
+        # Short Leg: 卖出第一档虚值 (OTM)
+        # 逻辑：找 > Price 的最小 Strike
+        short_strike = next((s for s in short_strikes if s > price * 1.005), None)
         
-        # 如果找不到合适的 OTM，说明当前 Chain 都在实值或者数据缺失，不要强行选取
-        if not short_strike: 
-            return None, None, None
+        # Long Leg: 买入第一档实值 (ITM) 或 平值 (ATM)
+        # 逻辑：找 <= Price 的最大 Strike
+        # 这里用 <= Price 确保是 ITM 或 ATM，比 OTM 的 Short 腿低，构成正向对角
+        long_strike_candidates = [s for s in long_strikes if s <= price]
+        long_strike = long_strike_candidates[-1] if long_strike_candidates else long_strikes[0]
 
-        # ---------------------------------------------------------
-        # 2. 寻找 Long Leg (买方腿) - Deep ITM LEAPS
-        # ---------------------------------------------------------
-        long_candidates = []
-        for exp_key in call_map.keys():
-            parts = exp_key.split(":")
-            exp_date = parts[0]
-            try: 
-                days = int(parts[1])
-            except (IndexError, ValueError): 
-                continue
-            
-            # LEAPS definition: usually > 1 year, but > 120 days is acceptable for diagonals
-            if days > 120: 
-                long_candidates.append((exp_date, days))
-        
-        if not long_candidates: 
-            return None, None, None
-
-        # 优先选 150-450 天 (Sweet spot for Theta decay curve vs Vega exposure)
-        ideal = [c for c in long_candidates if 150 <= c[1] <= 450]
-        if ideal:
-            ideal.sort(key=lambda x: x[1])
-            best_long_exp = ideal[0][0] # Pick the shortest valid LEAP to save Debit
-            # best_long_days = ideal[0][1]
-        else:
-            long_candidates.sort(key=lambda x: x[1])
-            best_long_exp = long_candidates[0][0]
-            # best_long_days = long_candidates[0][1]
-        
-        long_strikes_map = None
-        # 模糊匹配 Long Exp Key
-        for k in call_map.keys():
-            if k.startswith(best_long_exp):
-                long_strikes_map = call_map[k]
-                break
-        
-        if not long_strikes_map: 
-            return None, None, None
-
-        long_avail_strikes = sorted([float(s) for s in long_strikes_map.keys()])
-        
-        # [核心逻辑] Select Long Strike (Deep ITM)
-        # Target: ~70-75 Delta substitute. Roughly Price * 0.70 to 0.75.
-        target_strike = price * 0.70 
-        
-        # Find closest available strike
-        long_strike = min(long_avail_strikes, key=lambda x: abs(x - target_strike))
-
-        # [Safety Check] PMCC Golden Rule: Short Strike MUST be > Long Strike
+        # [保底逻辑] 确保 Long Strike < Short Strike (Call Diagonal 规则)
         if long_strike >= short_strike:
-            # Try to force a lower strike if available
-            lower_candidates = [s for s in long_avail_strikes if s < short_strike]
-            if lower_candidates:
-                long_strike = lower_candidates[0] # Aggressively deep
+            # 尝试下移 Long Strike
+            lower = [s for s in long_strikes if s < short_strike]
+            if lower:
+                long_strike = lower[-1]
             else:
-                return None, None, None # Cannot form a diagonal
+                # 实在没空间 (比如股价正好卡在两个 Strike 中间)，做 Calendar (同价)
+                # Calendar 也是一种特殊的 Diagonal
+                long_strike = short_strike
 
-        return short_strike, best_long_exp, long_strike
+        return short_strike, long_exp, long_strike
 
     def evaluate(self, ctx: Context) -> ScanRow:
         tsf = ctx.tsf
-        regime = str(tsf["regime"])
         hv_rank = float(ctx.hv.hv_rank)
         price = float(ctx.price)
         
-        # 获取 IV 数据
-        short_iv = float(tsf["short_iv"])
-        base_iv = float(tsf["base_iv"]) 
+        # 基础数据
+        short_iv = float(tsf.get("short_iv", 0))
+        edge_month = float(tsf.get("edge_month", 0)) # 这是关键 Edge
         
-        # [新增] 1. 计算 Edge (Short IV vs Long IV)
-        if base_iv > 0:
-            raw_edge = (short_iv - base_iv) / base_iv
-        else:
-            raw_edge = 0.0
-
         # 寻找结构
-        short_strike, long_exp, long_strike = self._find_strikes(ctx, str(tsf["short_exp"]))
+        short_strike, long_exp, long_strike = self._find_strikes(ctx)
         
-        # --- Scoring (0-100) ---
+        # --- Scoring ---
         bd = ScoreBreakdown(base=50)
-
-        # [修改] 连续打分逻辑
-        edge_score = int(self._clamp(raw_edge * 100, -20, 25))
-        bd.edge = edge_score
-
-        hv_score = int((50 - hv_rank) / 3)
-        bd.hv = int(self._clamp(hv_score, -15, 15))
-
-        if regime == "CONTANGO": 
-            bd.regime = +15 
-        elif regime == "NORMAL": 
-            bd.regime = +5
-        elif regime == "BACKWARDATION": 
-            bd.regime = -25 
-
-        if not (short_strike and long_strike):
-            bd.penalties = -999 
         
-        # 负 Edge 惩罚
-        if raw_edge < -0.05:
-            bd.penalties -= 20
+        # Edge 驱动 (权重最大)
+        bd.edge = int(self._clamp(edge_month * 80, -20, 40))
+        
+        # 结构分
+        if short_strike and long_strike:
+            bd.base += 10 # 成功构建结构奖励
+        else:
+            bd.penalties = -999 # 构建失败
+
+        # 负 Edge 惩罚 (Backwardation 不适合做 Diagonal)
+        if edge_month < 0:
+            bd.regime = -30
 
         score = bd.base + bd.regime + bd.edge + bd.hv + bd.curvature + bd.penalties
-
-        # --- Risk (Gamma Integration) ---
-        rbd = RiskBreakdown(base=30)
         
-        # [新增] 2. Gamma 风险估算 (这就是您要找的逻辑！)
-        est_gamma = 0.0 
-        try:
-            # 简化的 Gamma 估算：用于捕捉 ONDS 这种短久期高风险票
-            # 公式原理: Gamma ∝ 1 / (S * σ * √T)
-            dte_years = max(1, int(tsf["short_dte"])) / 365.0
-            if price > 0 and short_iv > 0:
-                est_gamma = 0.4 / (price * short_iv * (dte_years ** 0.5))
-        except:
-            est_gamma = 0.0
-
-        # Gamma 风险分档
-        if est_gamma > 0.10: rbd.gamma = +35  # 高危 (如 ONDS)
-        elif est_gamma > 0.05: rbd.gamma = +15
-        elif est_gamma > 0.02: rbd.gamma = +5
+        # --- Risk ---
+        # 复用 Long Gamma 的风险逻辑，因为轻量级 Diagonal 风险特征类似
+        risk = 30
+        if edge_month < 0: risk += 40
         
-        if regime == "BACKWARDATION": rbd.regime = +20
-
-        risk = rbd.base + rbd.dte + rbd.gamma + rbd.regime
-
-        tag = "PMCC"
-        if raw_edge > 0.10: tag += "+" 
+        tag = "DIAG"
+        if edge_month > 0.15: tag += "+"
 
         row = ScanRow(
             symbol=ctx.symbol,
             price=price,
-            short_exp=str(tsf["short_exp"]),
-            short_dte=int(tsf["short_dte"]),
+            short_exp=str(tsf.get("short_exp")),
+            short_dte=int(tsf.get("short_dte", 0)),
             short_iv=short_iv,
-            base_iv=base_iv,
-            edge=float(f"{raw_edge:.2f}"), # 显示真实 Edge
+            base_iv=float(tsf.get("month_iv", 0)),
+            edge=edge_month,
             hv_rank=hv_rank,
-            regime=regime,
-            curvature=str(tsf["curvature"]),
+            regime=str(tsf.get("regime")),
+            curvature=str(tsf.get("curvature")),
             tag=tag,
             cal_score=int(self._clamp(float(score), 0, 100)),
             short_risk=int(self._clamp(float(risk), 0, 100)),
             score_breakdown=bd,
-            risk_breakdown=rbd,
+            risk_breakdown=RiskBreakdown(base=risk),
         )
 
+        # 构建蓝图 (在此处生成，方便 Orchestrator 直接取用)
         if short_strike and long_strike:
-            row.meta = {
-                "strategy": "diagonal",
-                "short_strike": short_strike,
-                "long_exp": long_exp,
-                "long_strike": long_strike,
-                "spread_width": short_strike - long_strike,
-                "est_gamma": float(f"{est_gamma:.4f}") # 方便调试
-            }
+            bp = build_diagonal_blueprint(
+                symbol=ctx.symbol,
+                underlying=price,
+                chain=ctx.raw_chain,
+                short_exp=str(tsf.get("short_exp")),
+                long_exp=long_exp,
+                target_short_strike=short_strike,
+                target_long_strike=long_strike,
+                side="CALL"
+            )
+            row.blueprint = bp
+            
+            # Meta 数据用于前端显示
+            # Meta 数据用于前端显示
+        row.meta = {
+            "strategy": "diagonal",
+            "short_strike": short_strike,
+            "long_exp": long_exp,
+            "long_strike": long_strike,
+            "est_gamma": float(ctx.metrics.gamma) if ctx.metrics else 0.0,
+            
+            # 完整透传 TSF 数据
+            "micro_exp": tsf.get("micro_exp"),
+            "micro_dte": tsf.get("micro_dte"),
+            "micro_iv": tsf.get("micro_iv"),
+            "edge_micro": float(tsf.get("edge_micro", 0)), # <--- 补上了！
+            
+            "month_exp": tsf.get("month_exp"),
+            "month_dte": tsf.get("month_dte"),
+            "month_iv": tsf.get("month_iv"),
+            "edge_month": edge_month,
+        }
             
         return row
 
     def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
         row = self.evaluate(ctx)
         
-        if row.cal_score < min_score or row.short_risk > max_risk:
-            return None, f"Score {row.cal_score} too low or Risk {row.short_risk} too high."
+        if row.cal_score < min_score:
+            return None, "Score too low"
             
-        if not row.meta or "long_strike" not in row.meta:
-             return None, "No valid strike structure found."
-
-        # Extract data from meta
-        s_strike = row.meta["short_strike"]
-        l_strike = row.meta["long_strike"]
-        l_exp = row.meta["long_exp"]
-
-        # Construct concise rationale
-        rationale = (
-            f"PMCC Setup: Buy {l_exp} {l_strike}C (ITM) / Sell {row.short_exp} {s_strike}C (OTM). "
-            f"IV Rank {row.hv_rank:.1f} favors buying LEAPS. {row.regime} aids spread pricing."
-        )
+        if not row.blueprint:
+            return None, "Structure build failed"
 
         rec = Recommendation(
-            strategy=self.name,
+            strategy="DIAGONAL",
             symbol=ctx.symbol,
             action="OPEN DIAGONAL",
-            rationale=rationale,
-            entry_price=ctx.price, # Reference only
+            rationale=f"Tactical Diagonal: Edge {row.edge:.2f}",
+            entry_price=ctx.price,
             score=row.cal_score,
-            conviction="MEDIUM" if row.cal_score < 75 else "HIGH",
+            conviction="HIGH",
             meta=row.meta
         )
-        
         return rec, "OK"
 
 ================================================================================

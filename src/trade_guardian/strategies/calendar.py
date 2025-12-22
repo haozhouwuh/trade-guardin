@@ -52,8 +52,6 @@ class CalendarStrategy:
         gamma: continuous penalty based on gamma normalized vs front (or max)
         curvature: continuous penalty based on squeeze_ratio (only when SPIKY_FRONT)
         regime: small penalty (BACKWARDATION > CONTANGO > FLAT)
-
-        We also keep breakdown fields as integers for stable CLI output.
         """
         bd = RiskBreakdown(base=35)
 
@@ -105,7 +103,8 @@ class CalendarStrategy:
             #  sr 1.10..1.80 => 0..10
             curv_pen = 10.0 * self._clamp((sr - 1.10) / 0.70, 0.0, 1.0)
 
-        bd.curv = int(round(self._clamp(curv_pen, 0.0, 10.0)))
+        # [FIX] Issue A: 字段名修正为 curvature (原为 curv)
+        bd.curvature = int(round(self._clamp(curv_pen, 0.0, 10.0)))
 
         # -------- Regime penalty (small, not dominating) --------
         # BACKWARDATION means front richer -> short leg can be more dangerous (bigger adverse gamma & gap risk).
@@ -119,7 +118,8 @@ class CalendarStrategy:
         # -------- Penalties slot (reserved) --------
         bd.penalties = 0
 
-        total = bd.base + bd.dte + bd.gamma + bd.curv + bd.regime + bd.penalties
+        # [FIX] Issue A: 汇总计算也同步修正
+        total = bd.base + bd.dte + bd.gamma + bd.curvature + bd.regime + bd.penalties
         return int(self._clamp(float(total), 0.0, 100.0)), bd
 
     def evaluate(self, ctx: Context) -> ScanRow:
@@ -235,7 +235,7 @@ class CalendarStrategy:
             )
 
             short_gamma = float(p.gamma) if p.gamma is not None else 0.0
-            risk, _ = self._risk_score(
+            risk, rbd = self._risk_score(
                 ctx,
                 short_dte=int(p.dte),
                 short_gamma=short_gamma,
@@ -248,34 +248,52 @@ class CalendarStrategy:
 
             tag = self._tag(regime, curvature)
 
-            # first tradable that satisfies thresholds
+            # [FIX] Issue E: Correctly construct Recommendation object with meta dict
             if score >= min_score and risk <= max_risk:
+                meta_data = {
+                    "rank": int(rk),
+                    "exp": str(p.exp),
+                    "dte": int(p.dte),
+                    "iv": float(p.iv),
+                    "tag": tag,
+                    "risk_breakdown": rbd,
+                    "squeeze_ratio": squeeze_ratio
+                }
+                
                 rec = Recommendation(
-                    rec_rank=int(rk),
-                    rec_exp=str(p.exp),
-                    rec_dte=int(p.dte),
-                    rec_iv=float(p.iv),
-                    rec_edge=float(edge),
-                    rec_score=int(score),
-                    rec_risk=int(risk),
-                    rec_tag=tag,
-                    rec_breakdown=bd,
+                    strategy="CALENDAR",
+                    symbol=ctx.symbol,
+                    action="OPEN",
+                    rationale=f"Score {score} > {min_score}",
+                    entry_price=ctx.price,
+                    score=int(score),
+                    conviction="MEDIUM",
+                    meta=meta_data
                 )
                 summary = f"ok rk{rk} {p.exp} d{p.dte} e{edge:.2f} s{score} r{risk} {tag}"
                 return rec, summary
 
-            # track best attempt summary for watchlist
-            if best_attempt is None or score > best_attempt.rec_score:
+            # Track best attempt
+            if best_attempt is None or score > best_attempt.score:
+                meta_data = {
+                    "rank": int(rk),
+                    "exp": str(p.exp),
+                    "dte": int(p.dte),
+                    "iv": float(p.iv),
+                    "tag": tag,
+                    "risk_breakdown": rbd,
+                    "squeeze_ratio": squeeze_ratio
+                }
+                
                 best_attempt = Recommendation(
-                    rec_rank=int(rk),
-                    rec_exp=str(p.exp),
-                    rec_dte=int(p.dte),
-                    rec_iv=float(p.iv),
-                    rec_edge=float(edge),
-                    rec_score=int(score),
-                    rec_risk=int(risk),
-                    rec_tag=tag,
-                    rec_breakdown=bd,
+                    strategy="CALENDAR",
+                    symbol=ctx.symbol,
+                    action="WATCH",
+                    rationale="Best attempt",
+                    entry_price=ctx.price,
+                    score=int(score),
+                    conviction="LOW",
+                    meta=meta_data
                 )
                 best_summary = f"best rk{rk} {p.exp} d{p.dte} e{edge:.2f} s{score} r{risk} {tag}"
 

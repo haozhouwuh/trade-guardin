@@ -223,8 +223,18 @@ class SchwabClient:
             metrics.delta = short_point.delta
             metrics.theta = short_point.theta
 
-            return Context(symbol=symbol, price=price, iv=iv_data, hv=iv_data, tsf=tsf, raw_chain=raw_chain, metrics=metrics)
-
+            # [FIX] P0-1: 这里增加了 term=term_points
+            return Context(
+                symbol=symbol, 
+                price=price, 
+                iv=iv_data, 
+                hv=iv_data, 
+                tsf=tsf, 
+                raw_chain=raw_chain, 
+                metrics=metrics,
+                term=term_points 
+            )
+        
         except Exception as e:
             return None
 

@@ -34,7 +34,5 @@ class StrategyRegistry:
         if n in ("auto", "smart", "default"):
             return AutoStrategy(self.cfg, self.policy)
         
-
-
-        # 更新报错信息，提示用户支持的新策略
-        raise KeyError(f"Unknown strategy: {name}. Available: calendar, hv_calendar, long_gamma")
+        # [FIX] Minor: 修正报错信息，包含 diagonal 和 auto
+        raise KeyError(f"Unknown strategy: {name}. Available: calendar, hv_calendar, long_gamma, diagonal, auto")

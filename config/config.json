@@ -1,15 +1,11 @@
 {
-  "runtime": {
-    "autogen_config_if_missing": true
-  },
   "paths": {
-    "tickers_csv": "./data/tickers.csv",
-    "cache_dir": "./cache"
+    "tickers_csv": "data/tickers.csv",
+    "cache_dir": "cache"
   },
   "scan": {
-    "contract_type": "CALL",
     "throttle_sec": 0.5,
-    "days_default": 600
+    "contract_type": "ALL"
   },
   "rules": {
     "min_edge_short_base": 1.05
@@ -17,6 +13,19 @@
   "policy": {
     "base_rank": 1,
     "min_dte": 3,
-    "max_probe_rank": 3
+    "probe_count": 3
+  },
+  "strategies": {
+    "hv_calendar": {
+      "hv_rules": {
+        "hv_low_rank": 20.0,
+        "hv_mid_rank": 50.0,
+        "hv_high_rank": 70.0,
+        "hv_low_bonus": 10,
+        "hv_mid_bonus": 4,
+        "hv_high_penalty": -4,
+        "hv_extreme_penalty": -10
+      }
+    }
   }
 }

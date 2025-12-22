@@ -12,10 +12,8 @@ class HVInfo:
     hv_percentile: float = 0.0
     high_52w: float = 0.0
     low_52w: float = 0.0
-    # [Fix] 补全 SchwabClient 需要的状态字段
     status: str = "Success"
     msg: str = ""
-    # [Optional] 如果还需要其他统计字段，可以在此保留
     hv_low: float = 0.0
     hv_high: float = 0.0
     p50: float = 0.0
@@ -25,8 +23,8 @@ class HVInfo:
 @dataclass
 class TermPoint:
     """Term Structure Point (用于 term structure 计算)"""
-    exp: str = "" # [Fix] 确保有默认值，对应 date_iso
-    exp_date: str = "" # 兼容旧代码
+    exp: str = "" 
+    exp_date: str = "" 
     dte: int = 0
     iv: float = 0.0
     strike: float = 0.0
@@ -53,7 +51,9 @@ class Context:
     hv: IVData
     tsf: dict  # Term Structure Factors
     raw_chain: dict
-    metrics: Any = None # Optional for Greeks
+    metrics: Any = None 
+    # [FIX] P0-1: 增加 term 字段，防止 Calendar 策略报错
+    term: List[TermPoint] = field(default_factory=list) 
 
 @dataclass
 class ScoreBreakdown:
@@ -91,6 +91,8 @@ class ScanRow:
     score_breakdown: ScoreBreakdown
     risk_breakdown: RiskBreakdown
     meta: Dict[str, Any] = field(default_factory=dict)
+    # 允许动态挂载 blueprint
+    blueprint: Optional[Blueprint] = None
 
 @dataclass
 class Recommendation:
@@ -125,3 +127,10 @@ class Blueprint:
     note: str = ""
     gamma_exposure: float = 0.0
     error: Optional[str] = None
+    # 允许动态挂载 greeks 字典
+    short_greeks: Dict[str, float] = field(default_factory=dict)
+    long_greeks: Dict[str, float] = field(default_factory=dict)
+    greeks: Dict[str, float] = field(default_factory=dict)
+
+    def one_liner(self) -> str:
+        return f"{self.symbol} {self.strategy} | est_debit={self.est_debit}"

@@ -10,6 +10,8 @@ from colorama import Fore, Style
 from trade_guardian.domain.models import Context, ScanRow, Blueprint, OrderLeg
 from trade_guardian.app.persistence import PersistenceManager
 from trade_guardian.strategies.blueprint import build_straddle_blueprint 
+# [FIX] 引入限流器
+from trade_guardian.infra.rate_limit import RateLimiter
 
 # --- [交易员底线参数] ---
 MICRO_MIN = 0.10
@@ -21,21 +23,38 @@ class TradeGuardian:
         self.cfg = cfg
         self.policy = policy
         self.strategy = strategy 
-        self.tickers_path = os.path.join("data", "tickers.csv")
+        
+        # [FIX] P0-2: 从 Config 读取路径，不再硬编码
+        self.tickers_path = cfg.get("paths", {}).get("tickers_csv", "data/tickers.csv")
+        
+        # [FIX] Part 2, Item 5: 初始化限流器
+        throttle = float(cfg.get("scan", {}).get("throttle_sec", 0.5))
+        self.limiter = RateLimiter(throttle)
+        
         self.db = PersistenceManager()
         self.last_batch_df: Optional[pd.DataFrame] = None 
 
     def _get_universe(self) -> List[str]:
         if not os.path.exists(self.tickers_path):
-            print(f"\n❌ [CRITICAL ERROR] Tickers file NOT FOUND")
-            sys.exit(1)
+            # 尝试 fallback 到相对路径
+            fallback = os.path.join("data", "tickers.csv")
+            if os.path.exists(fallback):
+                self.tickers_path = fallback
+            else:
+                print(f"\n❌ [CRITICAL ERROR] Tickers file NOT FOUND at {self.tickers_path}")
+                sys.exit(1)
+                
         df = pd.read_csv(self.tickers_path, header=None)
+        # 简单的清洗
         return df[0].dropna().apply(lambda x: str(x).strip().upper()).tolist()
 
     def scanlist(self, strategy_name: str = "auto", days: int = 600, 
                  min_score: int = 60, max_risk: int = 70, detail: bool = False,
                  limit: int = None, **kwargs):
         
+        # [FIX] Issue B: 开始计时
+        start_ts = time.time()
+
         try:
             vix_q = self.client.get_quote("$VIX")
             current_vix = vix_q.get("lastPrice", 0.0) 
@@ -45,9 +64,8 @@ class TradeGuardian:
         if limit: tickers = tickers[:limit]
 
         db_results_pack = []  
-        all_rows_for_stats = [] 
-        current_rows_for_next_batch = [] 
         strict_results = [] 
+        current_rows_for_next_batch = [] 
         
         # DNA -> Shape (Display Structure Shape)
         FMT = "{sym:<5} {px:<7} {sexp:<11} {sdte:<3} {siv:>6} | {mexp:<11} {mdte:<3} {miv:>6} {em:>5} | {kexp:<11} {kdte:<3} {kiv:>6} {ek:>5} | {sc:>4} {shp:<8} {gate:<6}   {tag:<8}"
@@ -61,20 +79,24 @@ class TradeGuardian:
         WIDTH = len(HEADER)
 
         print("\n" + "=" * WIDTH)
-        print(f"🧠 TRADE GUARDIAN :: GRADUATION BUILD | VIX: {current_vix:.2f}")
+        print(f"🧠 TRADE GUARDIAN :: GRADUATION BUILD | VIX: {current_vix:.2f} | Strategy: {strategy_name}")
         print("-" * WIDTH)
         print(HEADER)
         print("-" * WIDTH)
 
         for ticker in tickers:
+            # [FIX] Part 2, Item 5: 循环内限流
+            self.limiter.sleep()
+
             try:
                 # 1. 构建上下文
                 ctx = self.client.build_context(ticker, days=days)
                 if not ctx: continue
                 
                 # 2. 策略路由
-                strategy = self._load_strategy("auto") 
-                row = strategy.evaluate(ctx)
+                # [FIX] P0-2: 优先使用传入的 strategy 对象，否则根据名称加载
+                current_strategy = self.strategy if self.strategy else self._load_strategy(strategy_name)
+                row = current_strategy.evaluate(ctx)
                 if not row: continue
 
                 # 3. 动能计算 (Momentum)
@@ -82,6 +104,7 @@ class TradeGuardian:
                 if self.last_batch_df is not None:
                     prev = self.last_batch_df[self.last_batch_df['symbol'] == row.symbol]
                     if not prev.empty:
+                        # 这里的比较非常基础，后续可以改为 % change
                         iv_diff = row.short_iv - prev.iloc[0]['iv']
                 
                 mom_type = "QUIET"
@@ -92,12 +115,11 @@ class TradeGuardian:
                 row.meta["delta_15m"] = iv_diff
                 row.meta["momentum"] = mom_type
 
-                # 4. 形态分类 (Shape Classifier)
-                # FFBS: Front-Flat Back-Steep (Ideal for Diagonal)
+                # 4. 形态分类 (Shape Classifier) - [FIX] P0-3: 严格对齐路由矩阵
                 tsf = ctx.tsf or {}
                 regime = str(tsf.get("regime", "FLAT"))
                 is_squeeze = bool(tsf.get("is_squeeze", False))
-                curvature = str(tsf.get("curvature", "NORMAL"))
+                # curvature = str(tsf.get("curvature", "NORMAL")) # 矩阵说不要单看这个
                 
                 em = float(row.meta.get("edge_micro", 0) or 0)
                 ek = float(row.meta.get("edge_month", 0) or 0)
@@ -106,11 +128,13 @@ class TradeGuardian:
                 if regime == "BACKWARDATION":
                     shape = "BACKWARD"
                 elif ek >= 0.20 and em < 0.08:
-                    shape = "FFBS" # 黄金对角线形态
-                elif is_squeeze or curvature == "SPIKY_FRONT" or em >= 0.12:
+                    shape = "FFBS" # 黄金对角线
+                elif is_squeeze or em >= 0.12: # [FIX] 矩阵规则：SPIKE 必须靠 em 或 squeeze
                     shape = "SPIKE"
-                elif ek >= 0.15:
+                elif ek >= 0.20: # [FIX] 矩阵规则：STEEP >= 0.20
                     shape = "STEEP"
+                elif 0.15 <= ek < 0.20: # [FIX] 矩阵规则：MILD 区间
+                    shape = "MILD"
                 else:
                     shape = "FLAT"
                 
@@ -125,7 +149,6 @@ class TradeGuardian:
                 gate = self._get_gate_status(row, bp, mom_type) 
                 
                 db_results_pack.append((row, ctx, bp, gate)) 
-                all_rows_for_stats.append(row)
                 current_rows_for_next_batch.append({'symbol': row.symbol, 'iv': row.short_iv})
                 
                 if gate != "FORBID":
@@ -139,6 +162,9 @@ class TradeGuardian:
                 
                 gate_display = f"{g_color}{gate:<6}{Style.RESET_ALL}"
                 
+                # Tag 可能为空的处理
+                tag_str = str(row.tag) if row.tag else ""
+
                 print(FMT.format(
                     sym=row.symbol,
                     px=f"{row.price:.1f}",
@@ -154,18 +180,42 @@ class TradeGuardian:
                     kiv=f"{int(row.meta.get('month_iv', 0))}%",
                     ek=f"{ek:.2f}",
                     sc=row.cal_score,
-                    shp=shape, # 显示 Shape
+                    shp=shape, 
                     gate=gate_display, 
-                    tag=row.tag
+                    tag=tag_str
                 ))
 
             except Exception as e:
                 print(f"❌ CRASH on {ticker}: {e}")
-                traceback.print_exc()
+                # traceback.print_exc() 
                 continue
 
-        self.last_batch_df = pd.DataFrame(current_rows_for_next_batch)
-        self.db.save_scan_session(strategy_name, current_vix, len(tickers), 0.0, 0.0, 0.0, db_results_pack)
+        # [FIX] (A) 核心修复：更新 last_batch_df，否则动能(Momentum)永远算不出来
+        if current_rows_for_next_batch:
+            self.last_batch_df = pd.DataFrame(current_rows_for_next_batch)
+        
+        # 计算统计指标 (保持你之前的统计逻辑)
+        elapsed = time.time() - start_ts
+        valid_rows = [item[0] for item in db_results_pack]
+        avg_abs_edge = 0.0
+        cheap_vol_pct = 0.0
+        
+        if valid_rows:
+            total_abs_edge = sum(abs(r.edge) for r in valid_rows)
+            avg_abs_edge = total_abs_edge / len(valid_rows)
+            cheap_count = sum(1 for r in valid_rows if r.edge > 0)
+            cheap_vol_pct = cheap_count / len(valid_rows)
+
+        # 保存会话
+        self.db.save_scan_session(
+            strategy_name, 
+            current_vix, 
+            len(tickers), 
+            avg_abs_edge, 
+            cheap_vol_pct, 
+            elapsed, 
+            db_results_pack
+        )
         
         if detail and strict_results:
             print(f"\n🚀 Actionable Blueprints (Tactical Mode)")
@@ -201,7 +251,6 @@ class TradeGuardian:
                 pass 
             
             # B. SPIKE: 前端挤压，风险极高 -> 降级保护 (Rule #4)
-            # 如果短腿 <= 7 DTE 且动能不强，强制 WAIT，不允许 LIMIT 被动吃 Gamma
             elif shape == "SPIKE":
                 if short_dte <= 7 and dna_type == "QUIET":
                     return "WAIT"
@@ -251,7 +300,6 @@ class TradeGuardian:
         print(f" {Fore.WHITE}{bp.symbol:<5} | Gate: {gate:<5} | Debit: ${bp.est_debit} | Gamma: {row.meta.get('est_gamma', 0):.4f}")
         print(f"    Edges: Micro {row.meta.get('edge_micro', 0):.2f} / Month {row.meta.get('edge_month', 0):.2f}")
         
-        # [新增] 形态解释
         shape = row.meta.get("shape", "")
         mom = row.meta.get("momentum", "QUIET")
         print(f"    Shape: {shape:<8} | Momentum: {mom}")
@@ -270,5 +318,6 @@ class TradeGuardian:
         print(f"    {'='*80}")
 
     def _load_strategy(self, name: str):
+        # [FIX] 如果需要动态加载，这里使用 Registry 会更好，但暂时保持原样以最小化改动
         from trade_guardian.strategies.auto import AutoStrategy
         return AutoStrategy(self.cfg, self.policy)

@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import pandas as pd
 import sys
@@ -9,18 +10,20 @@ from colorama import Fore, Style, init
 init(autoreset=True)
 
 class HistoryViewer:
-    def __init__(self, db_path="db/trade_guardian.db"):
-        self.db_path = db_path
+    def __init__(self, db_path=None):
+        if db_path:
+            self.db_path = db_path
+        else:
+            # [FIX] (C) 路径锚定：确保在任何目录运行都指向同一个库
+            root = os.path.dirname(os.path.abspath(__file__))
+            self.db_path = os.path.join(root, "db", "trade_guardian.db")
+
 
     def get_latest_radar(self, symbol=None, limit=20):
-        """
-        锁定最新物理批次，并读取 Tag
-        """
         conn = sqlite3.connect(self.db_path)
         try:
-            # 1. 获取最新的 batch 信息
             batch_res = conn.execute("""
-                SELECT b.batch_id, strftime('%H:%M:%S', b.timestamp), b.market_vix 
+                SELECT b.batch_id, b.timestamp, b.market_vix 
                 FROM scan_batches b
                 JOIN market_snapshots s ON s.batch_id = b.batch_id
                 ORDER BY b.batch_id DESC LIMIT 1
@@ -31,7 +34,10 @@ class HistoryViewer:
             
             latest_id, latest_time, current_vix = batch_res
             
-            # 2. 查询详细数据 (显式查询 p.tag)
+            # [FIX] (F) Symbol 过滤生效
+            filter_sql = "AND s.symbol = ?" if symbol else ""
+            params = [latest_id, symbol, limit] if symbol else [latest_id, limit]
+            
             query = f"""
             SELECT 
                 s.symbol as Sym,
@@ -44,20 +50,23 @@ class HistoryViewer:
                 COALESCE(p.tag, '') as Tag
             FROM market_snapshots s
             LEFT JOIN trade_plans p ON s.snapshot_id = p.snapshot_id
-            WHERE s.batch_id = ?
+            WHERE s.batch_id = ? {filter_sql}
             ORDER BY Score DESC, IV_S DESC
             LIMIT ?
             """
-            df = pd.read_sql_query(query, conn, params=(latest_id, limit))
+            
+            # 这里的 params 必须转换成 tuple 传给 read_sql_query
+            df = pd.read_sql_query(query, conn, params=tuple(params))
             
             if not df.empty:
-                df['Time'] = latest_time
+                df['Time'] = latest_time # (B) 此时已经是 YYYY-MM-DD HH:MM:SS 格式了
                 df['VIX'] = current_vix
                 df = self._process_logic(df, latest_id, conn)
             
             return df
         finally:
             conn.close()
+            
 
     def _process_logic(self, df, latest_id, conn):
         """
