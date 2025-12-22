@@ -86,11 +86,6 @@ class VerticalCreditStrategy(Strategy):
             return self._empty_row(ctx, 0, 99, "DTE < 15")
 
         # 2. 决策方向：Bull Put (PCS) vs Bear Call (CCS)
-        # 简单 Skew 判定：比较 25 Delta 的 Put 和 Call 谁更贵（IV更高）
-        # 这里为了简化，我们默认做 Bull Put (PCS)，因为美股长期看涨且 Put 端溢价通常更高。
-        # 如果需要 Bear Call，可以通过参数或逻辑扩展。
-        # 暂定逻辑：默认 Bull Put (PCS)
-        
         side_short = "PUT"
         side_long = "PUT"
         strat_tag = "PCS" # Put Credit Spread
@@ -149,6 +144,14 @@ class VerticalCreditStrategy(Strategy):
 
         calc_risk = max(0, 100 - score)
 
+        # [FIX] 关键修复：先复制 ctx.tsf (包含 Micro/Month 数据)，再更新 Vertical 独有的 meta
+        meta_data = ctx.tsf.copy() if ctx.tsf else {}
+        meta_data.update({
+            "credit": credit, 
+            "width": width, 
+            "est_gamma": 0.0  # Vertical 的 Gamma 极低，这里硬编码为 0 以通过 Hard Cap
+        })
+
         row = ScanRow(
             symbol=ctx.symbol,
             price=ctx.price,
@@ -165,15 +168,19 @@ class VerticalCreditStrategy(Strategy):
             short_risk=int(calc_risk),
             score_breakdown=ScoreBreakdown(base=50),
             risk_breakdown=RiskBreakdown(base=0),
-            meta={"credit": credit, "width": width, "est_gamma": 0.0}
+            meta=meta_data # 使用合并后的 meta
         )
         row.blueprint = bp
         return row
 
     def _empty_row(self, ctx, score, risk, note):
-        # Fallback row to show failure in dashboard
         from trade_guardian.domain.models import ScanRow, Blueprint, ScoreBreakdown, RiskBreakdown
         bp = Blueprint(ctx.symbol, "VERT-FAIL", [], 0.0, error=note, note=note)
+        
+        # 即使失败，也尽量保留 TSF 数据以便显示
+        meta_data = ctx.tsf.copy() if ctx.tsf else {}
+        meta_data["error"] = note
+        
         return ScanRow(
             symbol=ctx.symbol,
             price=ctx.price,
@@ -181,7 +188,7 @@ class VerticalCreditStrategy(Strategy):
             regime="N/A", curvature="N/A", tag="VERT-FAIL",
             cal_score=score, short_risk=risk,
             score_breakdown=ScoreBreakdown(), risk_breakdown=RiskBreakdown(),
-            meta={"error": note},
+            meta=meta_data,
             blueprint=bp
         )
         

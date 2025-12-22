@@ -7,23 +7,21 @@ from trade_guardian.domain.policy import ShortLegPolicy
 from trade_guardian.strategies.base import Strategy
 from trade_guardian.strategies.diagonal import DiagonalStrategy
 from trade_guardian.strategies.long_gamma import LongGammaStrategy
+from trade_guardian.strategies.vertical_credit import VerticalCreditStrategy
 
+# [NEW] 定义杠杆/高波 ETF 列表
+LEV_ETFS = ["TQQQ", "SQQQ", "SOXL", "SOXS", "TSLL", "TSLS", "NVDL", "LABU", "UVXY"]
 
 class AutoStrategy(Strategy):
     """
-    Strategy #5: Auto / Smart Router (Brain V5 - Structure First)
+    Strategy #5: Auto / Smart Router (Brain V7.1 - Strict LevETF Priority)
     
-    Philosophy:
-      - Structure Trumps Volatility: If the Term Structure offers a good edge (>0.20),
-        we prioritize Diagonal spreads to harvest Theta/Vega differential, even if IV is low.
-      - Low Vol Fallback: Only when structure is flat do we revert to Long Gamma (Straddle)
-        to play for pure expansion.
-    
-    Routing Order:
+    Routing Order (Corrected):
       1. Backwardation -> LG (Defense)
-      2. Edge > 0.20   -> DIAG (Attack Structure)
-      3. HV < 30       -> LG (Attack Vol Floor)
-      4. Default       -> LG
+      2. LevETF        -> VERTICAL (Force Gamma Neutrality)  <-- PRIORITY UP
+      3. Edge > 0.20   -> DIAG (Attack Structure)
+      4. High Volatility -> VERTICAL (Harvest Premium)
+      5. Default       -> LG
     """
     name = "auto"
 
@@ -32,47 +30,67 @@ class AutoStrategy(Strategy):
         self.policy = policy
         self.diagonal = DiagonalStrategy(cfg, policy)
         self.long_gamma = LongGammaStrategy(cfg, policy)
+        self.vertical = VerticalCreditStrategy(cfg, policy)
 
     def evaluate(self, ctx: Context) -> ScanRow:
         hv_rank = float(ctx.hv.hv_rank)
         tsf = ctx.tsf
         regime = str(tsf.get("regime", "FLAT"))
         edge_month = float(tsf.get("edge_month", 0.0))
+        current_iv = float(ctx.iv.current_iv)
+        is_lev_etf = ctx.symbol in LEV_ETFS
 
-        # --- 决策逻辑 (Brain V5) ---
+        # --- 决策逻辑 (Brain V7.1) ---
         
-        # 1. [倒挂保护] Backwardation -> 强制 Long Gamma
-        # 这种时候卖近端是自杀，必须防守
+        # 1. [倒挂保护] Backwardation -> 强制 Long Gamma (防守)
         if regime == "BACKWARDATION":
             row = self.long_gamma.evaluate(ctx)
             row.tag = f"AUTO-LG"
             return row
 
-        # 2. [结构优先] 只要 Edge 足够好 (> 0.20)，优先做 Diagonal
-        # 即使 HV 很低，优秀的结构也能提供比 Straddle 更好的盈亏比
-        # (包含了 > 0.35 的超级结构情况)
+        # 2. [杠杆降维打击] 只要是杠杆 ETF，强制走 Vertical
+        # 这一步必须在 Diagonal 之前，防止 TQQQ 被拉去做对角线
+        if is_lev_etf:
+            row_vert = self.vertical.evaluate(ctx)
+            if row_vert and "FAIL" not in (row_vert.tag or ""):
+                base_tag = row_vert.tag or "VERT"
+                row_vert.tag = f"AUTO-{base_tag}"
+                return row_vert
+
+        # 3. [结构优先] Edge > 0.20 -> Diagonal (进攻)
+        # 非杠杆 ETF，且结构好，做对角线
         if edge_month >= 0.20:
             row_diag = self.diagonal.evaluate(ctx)
-            # 只有构建成功才返回，否则掉下去走兜底
             if row_diag and row_diag.meta and "long_strike" in row_diag.meta:
                 row_diag.tag = f"AUTO-DIAG" 
                 return row_diag
 
-        # 3. [低波博弈] 结构平庸，但波动率在地板 -> 强制 Long Gamma
-        # NVDA (Edge 0.16) 会落到这里
+        # 4. [高波收租] HV Rank > 30 OR IV > 40% -> Vertical
+        if hv_rank > 30 or current_iv > 40.0:
+            row_vert = self.vertical.evaluate(ctx)
+            if row_vert and "FAIL" not in (row_vert.tag or ""):
+                base_tag = row_vert.tag or "VERT"
+                row_vert.tag = f"AUTO-{base_tag}"
+                return row_vert
+
+        # 5. [低波博弈] HV < 30 -> Long Gamma
         if hv_rank < 30:
             row = self.long_gamma.evaluate(ctx)
             row.tag = f"AUTO-LG" 
             return row
         
-        # 4. [默认兜底] 结构平坦且波动率中等 -> Long Gamma
+        # 6. [默认兜底] -> Long Gamma
         row = self.long_gamma.evaluate(ctx)
         row.tag = f"AUTO-LG"
         return row
 
     def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
         row = self.evaluate(ctx)
-        if "DIAG" in row.tag:
+        tag = row.tag or ""
+        
+        if "DIAG" in tag:
             return self.diagonal.recommend(ctx, min_score, max_risk)
+        elif "PCS" in tag or "CCS" in tag or "VERT" in tag:
+            return self.vertical.recommend(ctx, min_score, max_risk)
         else:
             return self.long_gamma.recommend(ctx, min_score, max_risk)

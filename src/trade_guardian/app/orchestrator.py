@@ -10,12 +10,16 @@ from colorama import Fore, Style
 from trade_guardian.domain.models import Context, ScanRow, Blueprint, OrderLeg
 from trade_guardian.app.persistence import PersistenceManager
 from trade_guardian.strategies.blueprint import build_straddle_blueprint 
-# [FIX] 引入限流器
 from trade_guardian.infra.rate_limit import RateLimiter
 
 # --- [交易员底线参数] ---
 MICRO_MIN = 0.10
 MONTH_MIN = 0.15
+
+# --- [风控阈值 V3.1 Strict] ---
+GAMMA_SOFT_CAP = 0.24  # 超过此值降级为 LIMIT
+GAMMA_HARD_CAP = 0.32  # 超过此值直接 FORBID (严厉模式)
+LEV_ETFS = ["TQQQ", "SQQQ", "SOXL", "SOXS", "TSLL", "TSLS", "NVDL", "LABU", "UVXY"]
 
 class TradeGuardian:
     def __init__(self, client, cfg: dict, policy, strategy=None):
@@ -24,10 +28,8 @@ class TradeGuardian:
         self.policy = policy
         self.strategy = strategy 
         
-        # [FIX] P0-2: 从 Config 读取路径，不再硬编码
         self.tickers_path = cfg.get("paths", {}).get("tickers_csv", "data/tickers.csv")
         
-        # [FIX] Part 2, Item 5: 初始化限流器
         throttle = float(cfg.get("scan", {}).get("throttle_sec", 0.5))
         self.limiter = RateLimiter(throttle)
         
@@ -36,23 +38,19 @@ class TradeGuardian:
 
     def _get_universe(self) -> List[str]:
         if not os.path.exists(self.tickers_path):
-            # 尝试 fallback 到相对路径
             fallback = os.path.join("data", "tickers.csv")
             if os.path.exists(fallback):
                 self.tickers_path = fallback
             else:
                 print(f"\n❌ [CRITICAL ERROR] Tickers file NOT FOUND at {self.tickers_path}")
                 sys.exit(1)
-                
         df = pd.read_csv(self.tickers_path, header=None)
-        # 简单的清洗
         return df[0].dropna().apply(lambda x: str(x).strip().upper()).tolist()
 
     def scanlist(self, strategy_name: str = "auto", days: int = 600, 
                  min_score: int = 60, max_risk: int = 70, detail: bool = False,
                  limit: int = None, **kwargs):
         
-        # [FIX] Issue B: 开始计时
         start_ts = time.time()
 
         try:
@@ -67,9 +65,7 @@ class TradeGuardian:
         strict_results = [] 
         current_rows_for_next_batch = [] 
         
-        # DNA -> Shape (Display Structure Shape)
         FMT = "{sym:<5} {px:<7} {sexp:<11} {sdte:<3} {siv:>6} | {mexp:<11} {mdte:<3} {miv:>6} {em:>5} | {kexp:<11} {kdte:<3} {kiv:>6} {ek:>5} | {sc:>4} {shp:<8} {gate:<6}   {tag:<8}"
-        
         HEADER = FMT.format(
             sym="Sym", px="Px", sexp="ShortExp", sdte="D", siv="S_IV",
             mexp="MicroExp", mdte="D", miv="M_IV", em="EdgM",
@@ -85,32 +81,27 @@ class TradeGuardian:
         print("-" * WIDTH)
 
         for ticker in tickers:
-            # [FIX] Part 2, Item 5: 循环内限流
             self.limiter.sleep()
 
             try:
                 # 1. 构建上下文
                 ctx = self.client.build_context(ticker, days=days)
                 if not ctx: 
-                    # [DEBUG 核心修改] 打印数据获取失败原因，不再静默
                     print(f"{Fore.RED}⚠️  SKIP {ticker:<5} | Reason: No Context (Empty Chain/Bad Data){Style.RESET_ALL}")
                     continue
                 
                 # 2. 策略路由
-                # [FIX] P0-2: 优先使用传入的 strategy 对象，否则根据名称加载
                 current_strategy = self.strategy if self.strategy else self._load_strategy(strategy_name)
                 row = current_strategy.evaluate(ctx)
                 if not row: 
-                    # [DEBUG 核心修改] 打印策略失败原因
                     print(f"{Fore.YELLOW}⚠️  SKIP {ticker:<5} | Reason: Strategy Eval Returned None{Style.RESET_ALL}")
                     continue
 
-                # 3. 动能计算 (Momentum)
+                # 3. 动能计算
                 iv_diff = 0.0
                 if self.last_batch_df is not None:
                     prev = self.last_batch_df[self.last_batch_df['symbol'] == row.symbol]
                     if not prev.empty:
-                        # 这里的比较非常基础，后续可以改为 % change
                         iv_diff = row.short_iv - prev.iloc[0]['iv']
                 
                 mom_type = "QUIET"
@@ -121,12 +112,10 @@ class TradeGuardian:
                 row.meta["delta_15m"] = iv_diff
                 row.meta["momentum"] = mom_type
 
-                # 4. 形态分类 (Shape Classifier) - [FIX] P0-3: 严格对齐路由矩阵
+                # 4. 形态分类
                 tsf = ctx.tsf or {}
                 regime = str(tsf.get("regime", "FLAT"))
                 is_squeeze = bool(tsf.get("is_squeeze", False))
-                # curvature = str(tsf.get("curvature", "NORMAL")) # 矩阵说不要单看这个
-                
                 em = float(row.meta.get("edge_micro", 0) or 0)
                 ek = float(row.meta.get("edge_month", 0) or 0)
                 
@@ -134,16 +123,15 @@ class TradeGuardian:
                 if regime == "BACKWARDATION":
                     shape = "BACKWARD"
                 elif ek >= 0.20 and em < 0.08:
-                    shape = "FFBS" # 黄金对角线
-                elif is_squeeze or em >= 0.12: # [FIX] 矩阵规则：SPIKE 必须靠 em 或 squeeze
+                    shape = "FFBS"
+                elif is_squeeze or em >= 0.12:
                     shape = "SPIKE"
-                elif ek >= 0.20: # [FIX] 矩阵规则：STEEP >= 0.20
+                elif ek >= 0.20:
                     shape = "STEEP"
-                elif 0.15 <= ek < 0.20: # [FIX] 矩阵规则：MILD 区间
+                elif 0.15 <= ek < 0.20:
                     shape = "MILD"
                 else:
                     shape = "FLAT"
-                
                 row.meta["shape"] = shape
                 
                 # 5. 获取蓝图
@@ -151,14 +139,19 @@ class TradeGuardian:
                 if not bp:
                     bp = self.plan(ctx, row) 
                 
-                # 6. 风控门槛 (Gate V6)
-                gate = self._get_gate_status(row, bp, mom_type) 
+                # 6. 风控门槛
+                # [MOD] 现在返回 (GateStatus, ReasonString)
+                gate, reason = self._get_gate_status(row, bp, mom_type)
                 
+                if gate != "EXEC" and bp:
+                    if not bp.error: 
+                        bp.error = reason
+
                 db_results_pack.append((row, ctx, bp, gate)) 
                 current_rows_for_next_batch.append({'symbol': row.symbol, 'iv': row.short_iv})
                 
                 if gate != "FORBID":
-                    strict_results.append((row, ctx, bp, gate, mom_type))
+                    strict_results.append((row, ctx, bp, gate, mom_type, reason))
 
                 # 7. 打印
                 if gate == "EXEC": g_color = Fore.GREEN
@@ -167,8 +160,6 @@ class TradeGuardian:
                 else: g_color = Fore.YELLOW
                 
                 gate_display = f"{g_color}{gate:<6}{Style.RESET_ALL}"
-                
-                # Tag 可能为空的处理
                 tag_str = str(row.tag) if row.tag else ""
 
                 print(FMT.format(
@@ -193,14 +184,12 @@ class TradeGuardian:
 
             except Exception as e:
                 print(f"❌ CRASH on {ticker}: {e}")
-                # traceback.print_exc() # 可选打开
                 continue
 
-        # [FIX] (A) 核心修复：更新 last_batch_df，否则动能(Momentum)永远算不出来
         if current_rows_for_next_batch:
             self.last_batch_df = pd.DataFrame(current_rows_for_next_batch)
         
-        # 计算统计指标 (保持你之前的统计逻辑)
+        # 统计指标
         elapsed = time.time() - start_ts
         valid_rows = [item[0] for item in db_results_pack]
         avg_abs_edge = 0.0
@@ -212,7 +201,6 @@ class TradeGuardian:
             cheap_count = sum(1 for r in valid_rows if r.edge > 0)
             cheap_vol_pct = cheap_count / len(valid_rows)
 
-        # 保存会话
         self.db.save_scan_session(
             strategy_name, 
             current_vix, 
@@ -226,61 +214,95 @@ class TradeGuardian:
         if detail and strict_results:
             print(f"\n🚀 Actionable Blueprints (Tactical Mode)")
             print("-" * WIDTH)
-            for row, ctx, bp, gate, dna in strict_results:
-                self._print_enhanced_blueprint(bp, row, dna, gate)
+            for row, ctx, bp, gate, dna, reason in strict_results:
+                self._print_enhanced_blueprint(bp, row, dna, gate, reason)
         print("-" * WIDTH)
 
-    def _get_gate_status(self, row: ScanRow, bp: Optional[Blueprint], dna_type: str) -> str:
+    def _get_gate_status(self, row: ScanRow, bp: Optional[Blueprint], dna_type: str) -> Tuple[str, str]:
+        """
+        Gate Logic V3.1: Strict Gamma Enforcement
+        """
+        # 1. Hard Kill (绝对风控) - 优先级最高
+        if not bp or bp.error: 
+            return "FORBID", f"Blueprint Error: {bp.error if bp else 'None'}"
+        
         est_gamma = row.meta.get("est_gamma", 0.0)
         
-        # --- Layer 1: Hard Kill (绝对风控) ---
-        if not bp or bp.error: return "FORBID"
-        if est_gamma >= 0.30: return "FORBID" 
-        if dna_type == "CRUSH": return "FORBID" 
+        # [CRITICAL FIX] Gamma Hard Cap 必须在所有逻辑之前
+        # 无论策略评分多高，无论是否 WAIT，只要 Gamma 超标，必须 FORBID
+        if est_gamma >= GAMMA_HARD_CAP:
+            return "FORBID", f"Gamma {est_gamma:.3f} >= {GAMMA_HARD_CAP} (Hard Cap)"
         
+        # [MOD] DNA Crush Hard Kill
+        if dna_type == "CRUSH":
+            return "FORBID", "Momentum: IV CRUSH (-Delta)"
+
+        # 2. Strategy & Shape Gate
+        tag = row.tag or ""
         em = row.meta.get("edge_micro", 0)
         ek = row.meta.get("edge_month", 0)
         shape = row.meta.get("shape", "FLAT")
-        tag = row.tag or ""
-        short_dte = row.short_dte
         
-        # --- Layer 2: Strategy & Shape Gate (结构门槛) ---
-        
+        status = "WAIT"
+        reason = "Score/Structure suboptimal"
+
+        # 策略逻辑判定
         if "DIAG" in tag:
-            # [DIAG 核心] 看后端结构 (ek)
             if ek < MONTH_MIN:
-                return "WAIT"
-            
-            # [形态特判]
-            # A. FFBS / STEEP: 完美形态，豁免前端微结构要求 (em)
-            if shape in ["FFBS", "STEEP"]:
-                pass 
-            
-            # B. SPIKE: 前端挤压，风险极高 -> 降级保护 (Rule #4)
+                status = "WAIT"
+                reason = f"Back Edge {ek:.2f} < {MONTH_MIN}"
+            elif shape in ["FFBS", "STEEP"]:
+                status = "EXEC" 
+                reason = "Structure Prime"
             elif shape == "SPIKE":
-                if short_dte <= 7 and dna_type == "QUIET":
-                    return "WAIT"
-                # 如果是 SPIKE 但 em 极差 (理论上 SPIKE em 应该高，这里是兜底)
+                status = "WAIT"
+                reason = "Spike Shape (Front IV too high)"
+            else: # FLAT/MILD
                 if em < MICRO_MIN:
-                    return "WAIT"
-
-            # C. 其他形态 (FLAT/MILD): 必须双边达标
-            else:
-                if em < MICRO_MIN:
-                    return "WAIT"
-
-        else:
-            # [LG 核心] 前端不能太烂，或者纯博低波
-            # 如果 em 和 ek 双低，且没有特殊原因，WAIT
-            if em < MICRO_MIN and ek < MONTH_MIN:
-                return "WAIT"
-
-        # --- Layer 3: Momentum Gate (动能执行) ---
-        if dna_type in ["PULSE", "TREND"]:
-            return "EXEC"
-        else:
-            return "LIMIT"
+                    status = "WAIT"
+                    reason = f"Front Edge {em:.2f} too low"
+                else:
+                    status = "LIMIT"
+                    reason = "Structure OK"
         
+        elif "PCS" in tag or "CCS" in tag or "VERT" in tag:
+            # 卖方策略
+            if row.cal_score >= 60:
+                status = "LIMIT" 
+                reason = "Vertical Setup OK"
+            else:
+                status = "WAIT"
+                reason = f"Score {row.cal_score} < 60"
+        
+        else:
+            # LG / Straddle
+            if em < MICRO_MIN and ek < MONTH_MIN:
+                status = "WAIT"
+                reason = "Both Edges Low"
+            else:
+                status = "LIMIT"
+                reason = "Standard LG Setup"
+
+        # 3. [MOD] Gamma Soft Cap (降级逻辑)
+        # 如果通过了前面的检查（变成了 EXEC/LIMIT），再检查 Soft Cap
+        if status in ["EXEC", "LIMIT"] and est_gamma >= GAMMA_SOFT_CAP:
+            status = "LIMIT"
+            reason = f"Gamma {est_gamma:.3f} > {GAMMA_SOFT_CAP} (Soft Cap)"
+        
+        # 4. Momentum Gate
+        if status == "EXEC":
+            if dna_type == "QUIET":
+                status = "LIMIT"
+                reason = "Momentum Quiet (Wait for Pulse)"
+            elif dna_type in ["PULSE", "TREND"]:
+                status = "EXEC"
+                reason = f"Momentum Active ({dna_type})"
+        
+        # 5. Diagnostic Tags
+        if row.symbol in LEV_ETFS and est_gamma > 0.20:
+             reason += " [LEV_ETF Risk]"
+
+        return status, reason
 
     def plan(self, ctx: Context, row: ScanRow) -> Optional[Blueprint]:
         bp = build_straddle_blueprint(
@@ -294,22 +316,18 @@ class TradeGuardian:
             return bp
         return Blueprint(ctx.symbol, "STRADDLE", [], 0.0, "Build Failed", error="No Pricing Data")
 
-    def _print_enhanced_blueprint(self, bp: Blueprint, row: ScanRow, dna: str, gate: str):
+    def _print_enhanced_blueprint(self, bp: Blueprint, row: ScanRow, dna: str, gate: str, reason: str):
         tactic = ""
         if gate == "LIMIT":
-            tactic = f"{Fore.CYAN}[挂单潜伏] Limit @ Mid-$0.05 | 等待 DNA 激活{Style.RESET_ALL}"
+            tactic = f"{Fore.CYAN}[挂单潜伏] Limit @ Mid-$0.05 | {reason}{Style.RESET_ALL}"
         elif gate == "EXEC":
-            tactic = f"{Fore.GREEN}[立即执行] Market/Mid+$0.02 | 动能确立{Style.RESET_ALL}"
+            tactic = f"{Fore.GREEN}[立即执行] Market/Mid+$0.02 | {reason}{Style.RESET_ALL}"
         elif gate == "WAIT":
-             tactic = f"{Fore.YELLOW}[保持关注] 尚未达到入场标准{Style.RESET_ALL}"
+             tactic = f"{Fore.YELLOW}[保持关注] {reason}{Style.RESET_ALL}"
 
-        # [FIX UX] 在这里显式加入策略名称 (bp.strategy)
-        # 如果 blueprint 里的策略名太长，这里做个简单的格式化
         strat_name = bp.strategy if bp.strategy else "UNKNOWN"
         
-        # 修改了这一行打印格式：增加 {strat_name:<13}
         print(f" {Fore.WHITE}{bp.symbol:<5} {strat_name:<13} | Gate: {gate:<5} | Debit: ${bp.est_debit} | Gamma: {row.meta.get('est_gamma', 0):.4f}")
-        
         print(f"    Edges: Micro {row.meta.get('edge_micro', 0):.2f} / Month {row.meta.get('edge_month', 0):.2f}")
         
         shape = row.meta.get("shape", "")
@@ -317,7 +335,7 @@ class TradeGuardian:
         print(f"    Shape: {shape:<8} | Momentum: {mom}")
         
         if "DIAG" in (row.tag or "") and shape == "FFBS":
-            print(f"    ✅ {Fore.GREEN}FFBS (Front-Flat Back-Steep): 完美对角线形态，前端安稳，后端高溢价。{Style.RESET_ALL}")
+            print(f"    ✅ {Fore.GREEN}FFBS (Front-Flat Back-Steep): 完美对角线形态{Style.RESET_ALL}")
         
         print(f"    👉 {tactic}")
         
@@ -328,17 +346,12 @@ class TradeGuardian:
         else:
             print(f"       [ERROR] No Legs: {bp.error}")
         print(f"    {'='*80}")
-        
 
     def _load_strategy(self, name: str):
-        # [FIX] 动态加载机制：使用 Registry，确保识别新策略 (IC)
-        # 这里为了简化不改构造函数，直接在方法内 import
         from trade_guardian.domain.registry import StrategyRegistry
-        # 注意：这里需要临时构造一个 Registry
         registry = StrategyRegistry(self.cfg, self.policy)
         try:
             return registry.get(name)
         except:
-            # Fallback (如果 Registry 报错)
             from trade_guardian.strategies.auto import AutoStrategy
             return AutoStrategy(self.cfg, self.policy)
