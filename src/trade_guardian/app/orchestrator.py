@@ -91,13 +91,19 @@ class TradeGuardian:
             try:
                 # 1. 构建上下文
                 ctx = self.client.build_context(ticker, days=days)
-                if not ctx: continue
+                if not ctx: 
+                    # [DEBUG 核心修改] 打印数据获取失败原因，不再静默
+                    print(f"{Fore.RED}⚠️  SKIP {ticker:<5} | Reason: No Context (Empty Chain/Bad Data){Style.RESET_ALL}")
+                    continue
                 
                 # 2. 策略路由
                 # [FIX] P0-2: 优先使用传入的 strategy 对象，否则根据名称加载
                 current_strategy = self.strategy if self.strategy else self._load_strategy(strategy_name)
                 row = current_strategy.evaluate(ctx)
-                if not row: continue
+                if not row: 
+                    # [DEBUG 核心修改] 打印策略失败原因
+                    print(f"{Fore.YELLOW}⚠️  SKIP {ticker:<5} | Reason: Strategy Eval Returned None{Style.RESET_ALL}")
+                    continue
 
                 # 3. 动能计算 (Momentum)
                 iv_diff = 0.0
@@ -187,7 +193,7 @@ class TradeGuardian:
 
             except Exception as e:
                 print(f"❌ CRASH on {ticker}: {e}")
-                # traceback.print_exc() 
+                # traceback.print_exc() # 可选打开
                 continue
 
         # [FIX] (A) 核心修复：更新 last_batch_df，否则动能(Momentum)永远算不出来
@@ -297,7 +303,13 @@ class TradeGuardian:
         elif gate == "WAIT":
              tactic = f"{Fore.YELLOW}[保持关注] 尚未达到入场标准{Style.RESET_ALL}"
 
-        print(f" {Fore.WHITE}{bp.symbol:<5} | Gate: {gate:<5} | Debit: ${bp.est_debit} | Gamma: {row.meta.get('est_gamma', 0):.4f}")
+        # [FIX UX] 在这里显式加入策略名称 (bp.strategy)
+        # 如果 blueprint 里的策略名太长，这里做个简单的格式化
+        strat_name = bp.strategy if bp.strategy else "UNKNOWN"
+        
+        # 修改了这一行打印格式：增加 {strat_name:<13}
+        print(f" {Fore.WHITE}{bp.symbol:<5} {strat_name:<13} | Gate: {gate:<5} | Debit: ${bp.est_debit} | Gamma: {row.meta.get('est_gamma', 0):.4f}")
+        
         print(f"    Edges: Micro {row.meta.get('edge_micro', 0):.2f} / Month {row.meta.get('edge_month', 0):.2f}")
         
         shape = row.meta.get("shape", "")
@@ -316,8 +328,17 @@ class TradeGuardian:
         else:
             print(f"       [ERROR] No Legs: {bp.error}")
         print(f"    {'='*80}")
+        
 
     def _load_strategy(self, name: str):
-        # [FIX] 如果需要动态加载，这里使用 Registry 会更好，但暂时保持原样以最小化改动
-        from trade_guardian.strategies.auto import AutoStrategy
-        return AutoStrategy(self.cfg, self.policy)
+        # [FIX] 动态加载机制：使用 Registry，确保识别新策略 (IC)
+        # 这里为了简化不改构造函数，直接在方法内 import
+        from trade_guardian.domain.registry import StrategyRegistry
+        # 注意：这里需要临时构造一个 Registry
+        registry = StrategyRegistry(self.cfg, self.policy)
+        try:
+            return registry.get(name)
+        except:
+            # Fallback (如果 Registry 报错)
+            from trade_guardian.strategies.auto import AutoStrategy
+            return AutoStrategy(self.cfg, self.policy)

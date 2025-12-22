@@ -156,8 +156,9 @@ FILE_PATH: create_tg_db.py
 import sqlite3
 import os
 import sys
+import argparse
 
-def init_db():
+def init_db(reset_mode=False):
     # ==========================================
     # 1. 路径定位逻辑
     # ==========================================
@@ -175,32 +176,38 @@ def init_db():
         print(f"🛠️  Creating DB folder: {db_folder}")
         os.makedirs(db_folder)
     
-    # 🚨 [新增逻辑] 暴力重置：如果旧库存在，直接删除，确保新字段生效！
+    # ==========================================
+    # 3. 重置逻辑 (Safety Guard)
+    # ==========================================
     if os.path.exists(db_path):
-        try:
-            os.remove(db_path)
-            print(f"💥 Deleted old database to apply new schema: {db_path}")
-        except Exception as e:
-            print(f"❌ Error deleting old DB: {e}")
-            return
+        if reset_mode:
+            try:
+                os.remove(db_path)
+                print(f"💥 [RESET MODE] Deleted old database: {db_path}")
+            except Exception as e:
+                print(f"❌ Error deleting old DB: {e}")
+                return
+        else:
+            print(f"🛡️  [SAFE MODE] Database exists. Keeping data. (Use --reset to wipe)")
+    else:
+        print(f"🆕 Database not found. Creating new one.")
 
     print(f"🔗 Connecting to database: {db_path}")
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
 
     # ==========================================
-    # 3. 创建表结构 (Schema)
+    # 4. 创建表结构 (Schema) - 使用 IF NOT EXISTS
     # ==========================================
 
     # 表 1: Scan Batches (扫描批次/会话)
-    # 记录每一次运行 scanlist 的全局信息和市场宏观状态
     print("   ... Checking table: scan_batches")
     c.execute('''
         CREATE TABLE IF NOT EXISTS scan_batches (
             batch_id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,           -- 系统启动时间 (ISO 格式)
             strategy_name TEXT,       -- 运行的策略 (auto/long_gamma/diagonal)
-            market_vix REAL,          -- [新增] 扫描时的 VIX 指数水平
+            market_vix REAL,          -- 扫描时的 VIX 指数水平
             universe_size INTEGER,    -- 扫描的标的总数
             avg_abs_edge REAL,        -- 市场平均偏离强度 (温度计)
             cheap_vol_pct REAL,       -- 便宜货占比 (Edge > 0)
@@ -209,7 +216,6 @@ def init_db():
     ''')
 
     # 表 2: Market Snapshots (行情快照)
-    # 记录每只股票在 T 时刻被扫描到的原始状态
     print("   ... Checking table: market_snapshots")
     c.execute('''
         CREATE TABLE IF NOT EXISTS market_snapshots (
@@ -227,7 +233,6 @@ def init_db():
     ''')
 
     # 表 3: Trade Plans & Gates (执行计划与风险闸门)
-    # 记录 Trade Guardian 对该行情切面做出的决策细节
     print("   ... Checking table: trade_plans")
     c.execute('''
         CREATE TABLE IF NOT EXISTS trade_plans (
@@ -241,7 +246,7 @@ def init_db():
             est_debit REAL,           -- 估算权利金成本
             error_msg TEXT,           -- 如果被拒绝，记录原因 (如 Debit > Width)
             blueprint_json TEXT,      -- 完整的蓝图结构 (JSON 格式)
-            tag TEXT,                 -- [新增] 策略标签 (LG-M-K)
+            tag TEXT,                 -- 策略标签 (LG-M-K)
             FOREIGN KEY(snapshot_id) REFERENCES market_snapshots(snapshot_id)
         )
     ''')
@@ -252,9 +257,10 @@ def init_db():
     c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
     tables = c.fetchall()
     
-    # 验证字段是否存在
+    # 验证关键字段是否存在 (Tag check)
     c.execute("PRAGMA table_info(trade_plans)")
-    tp_cols = [row[1] for row in c.fetchall()]
+    tp_info = c.fetchall()
+    tp_cols = [row[1] for row in tp_info]
     
     conn.close()
 
@@ -262,15 +268,25 @@ def init_db():
     for t in tables:
         print(f"   - {t[0]}")
     
+    # 简单的 Schema 检查
     if 'tag' in tp_cols:
-        print(f"🎉 Verification: 'tag' column successfully added!")
+        print(f"🎉 Verification: 'tag' column exists.")
     else:
-        print(f"❌ Verification Failed: 'tag' column missing!")
+        print(f"⚠️  Verification Warning: 'tag' column MISSING! (You might need to run with --reset to apply new schema)")
+
+    if 'short_risk' in tp_cols:
+        print(f"🎉 Verification: 'short_risk' column exists.")
+    else:
+        print(f"⚠️  Verification Warning: 'short_risk' column MISSING!")
 
     print(f"\n🎯 Database Location: {db_path}")
 
 if __name__ == "__main__":
-    init_db()
+    parser = argparse.ArgumentParser(description="Initialize Trade Guardian Database")
+    parser.add_argument("--reset", action="store_true", help="⚠️  DANGER: Wipe existing database and start fresh")
+    args = parser.parse_args()
+    
+    init_db(reset_mode=args.reset)
 
 ================================================================================
 FILE_PATH: history_viewer.py
@@ -343,7 +359,7 @@ class HistoryViewer:
             return df
         finally:
             conn.close()
-            
+
 
     def _process_logic(self, df, latest_id, conn):
         """
@@ -439,16 +455,16 @@ class HistoryViewer:
         v_info = f" | VIX: {df['VIX'].iloc[0]} ({Fore.RED if v_diff > 0 else Fore.GREEN}{v_diff:+0.2f}{Style.RESET_ALL})"
         
         # 调整横线宽度以适配新增的列
-        print("\n" + "="*126)
+        print("\n" + "="*118)
         print(f"📡 DNA MOMENTUM RADAR | {df['Time'].iloc[0]}{v_info}")
-        print("="*126)
+        print("="*118)
         
         # 定义表头，确保与 row 数据列数一致
         headers = ["Time", "Sym", "DNA", "Price", "IV_S", "Δ15m", "Δ1h", "Gamma", "Score", "Gate", "Tag"]
         
         # stralign="left" 防止 tabulate 自动居中导致颜色代码错位
         print(tabulate(formatted_rows, headers=headers, tablefmt='psql', stralign="left", disable_numparse=True))
-        print("\n" + "="*126)
+        print("\n" + "="*118)
 
         
 if __name__ == "__main__":
