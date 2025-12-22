@@ -1,6 +1,8 @@
 import sqlite3
 import os
+import json
 from datetime import datetime
+from dataclasses import asdict
 
 class PersistenceManager:
     def __init__(self, db_path=None):
@@ -50,10 +52,21 @@ class PersistenceManager:
                 est_debit = bp.est_debit if bp else 0.0
                 strat_name = bp.strategy if bp else "NONE"
                 
+                # --- [NEW] 蓝图序列化逻辑 ---
+                bp_json_str = ""
+                if bp:
+                    try:
+                        # 将 dataclass 转换为字典，再序列化为 JSON 字符串
+                        bp_dict = asdict(bp)
+                        bp_json_str = json.dumps(bp_dict)
+                    except Exception as e:
+                        print(f"⚠️ Failed to serialize blueprint for {row.symbol}: {e}")
+
+                # --- [NEW] 插入 blueprint_json ---
                 c.execute("""INSERT INTO trade_plans 
-                          (snapshot_id, strategy_type, cal_score, short_risk, gate_status, est_debit, total_gamma, tag) 
-                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                          (snap_id, strat_name, row.cal_score, row.short_risk, gate, est_debit, est_gamma, tag_val))
+                          (snapshot_id, strategy_type, cal_score, short_risk, gate_status, est_debit, total_gamma, tag, blueprint_json) 
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (snap_id, strat_name, row.cal_score, row.short_risk, gate, est_debit, est_gamma, tag_val, bp_json_str))
                 
             conn.commit()
             print(f"💾 [DB] Saved Batch {batch_id}: {count} items | AvgEdge: {avg_edge:.2f} | Time: {elapsed:.1f}s")

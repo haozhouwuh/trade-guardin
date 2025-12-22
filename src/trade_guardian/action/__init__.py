@@ -1,0 +1,2 @@
+
+from .sniper import Sniper

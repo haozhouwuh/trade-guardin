@@ -207,7 +207,7 @@ class HistoryViewer:
         print(f"📡 RADAR | {last_time} | Run: {int(uptime_min)}m | Mode: {mode_str} | {v_info}")
         print("="*100)
         
-        headers = ["Sym", "DNA", "Price", "IV_S", "Δ10m", "Δ1h", "Gamma", "Scr", "Gate", "Tag"]
+        headers = ["Sym", "DNA", "Price", "IV_S", "Δ10m", "Δ1h", "Gamma", "Score", "Gate", "Tag"]
         print(tabulate(formatted_rows, headers=headers, tablefmt='simple', stralign="right", disable_numparse=True))
         print("-" * 100)
 
