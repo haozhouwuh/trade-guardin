@@ -14,7 +14,7 @@ def run_guardian_loop():
     """
     守护者模式：每 15 分钟自动执行一次全量扫描并存库
     """
-    INTERVAL = 15 * 60  # 15 分钟 (900秒)
+    INTERVAL = 10 * 60  # 10 分钟 (600秒)
     
     print("="*80)
     print(f"🛡️  TRADE GUARDIAN - DAEMON MODE ACTIVE")

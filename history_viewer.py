@@ -70,7 +70,8 @@ class HistoryViewer:
 
     def _process_logic(self, df, latest_id, conn):
         """
-        计算动能 (Delta 15m / 1h)
+        计算动能 (Delta 10m / 1h)
+        Updated for 10-minute interval
         """
         # 获取上一个 Batch 的 VIX 用于计算差值
         v_prev = conn.execute("SELECT market_vix FROM scan_batches WHERE batch_id = ?", (latest_id-1,)).fetchone()
@@ -79,20 +80,23 @@ class HistoryViewer:
         for i, row in df.iterrows():
             sym = row['Sym']
             # 尝试获取历史 IV 数据
-            res15 = conn.execute("SELECT iv_short FROM market_snapshots WHERE symbol=? AND batch_id=?", (sym, latest_id-1)).fetchone()
-            res1h = conn.execute("SELECT iv_short FROM market_snapshots WHERE symbol=? AND batch_id=?", (sym, latest_id-4)).fetchone()
+            # Delta 10m: 回溯 1 个批次 (1 * 10m = 10m)
+            res10 = conn.execute("SELECT iv_short FROM market_snapshots WHERE symbol=? AND batch_id=?", (sym, latest_id-1)).fetchone()
+            # Delta 1h:  回溯 6 个批次 (6 * 10m = 60m)
+            res1h = conn.execute("SELECT iv_short FROM market_snapshots WHERE symbol=? AND batch_id=?", (sym, latest_id-6)).fetchone()
 
-            d15 = round(row['IV_S'] - (res15[0] if res15 else row['IV_S']), 1)
+            d10 = round(row['IV_S'] - (res10[0] if res10 else row['IV_S']), 1)
             d1h = round(row['IV_S'] - (res1h[0] if res1h else row['IV_S']), 1)
             
-            df.at[i, 'Δ15m'] = d15
+            df.at[i, 'Δ10m'] = d10
             df.at[i, 'Δ1h'] = d1h
 
             # DNA 判定 (仅用于显示颜色)
             dna_type = "QUIET"
-            if d15 > 2.0: dna_type = "PULSE"
-            elif d15 > 0.5: dna_type = "TREND"
-            elif d15 < -1.0: dna_type = "CRUSH"
+            # 10分钟内 IV 剧烈变化阈值判定
+            if d10 > 2.0: dna_type = "PULSE"
+            elif d10 > 0.5: dna_type = "TREND"
+            elif d10 < -1.0: dna_type = "CRUSH"
             
             df.at[i, 'DNA_Raw'] = dna_type
                 
@@ -109,19 +113,20 @@ class HistoryViewer:
             # --- 1. 数据格式化 (纯文本，固定宽度) ---
             p_str = f"{row['Price']:>10.2f}"
             iv_str = f"{row['IV_S']:>8.1f}%"
-            d15_raw = f"{row['Δ15m']:>+6.1f}"
+            # 改为显示 10m 数据
+            d10_raw = f"{row['Δ10m']:>+6.1f}"
             d1h_raw = f"{row['Δ1h']:>+6.1f}"
             g_str = f"{row['Gamma']:>8.3f}"
             s_str = f"{row['Score']:>5}"
             
             # --- 2. 颜色渲染 ---
             
-            # 动能 (Δ15m)
-            d15_render = d15_raw
-            if row['Δ15m'] > 1.5: 
-                d15_render = f"{Fore.RED}{d15_raw}{Style.RESET_ALL}"
-            elif row['Δ15m'] < -1.5: 
-                d15_render = f"{Fore.CYAN}{d15_raw}{Style.RESET_ALL}"
+            # 动能 (Δ10m)
+            d10_render = d10_raw
+            if row['Δ10m'] > 1.5: 
+                d10_render = f"{Fore.RED}{d10_raw}{Style.RESET_ALL}"
+            elif row['Δ10m'] < -1.5: 
+                d10_render = f"{Fore.CYAN}{d10_raw}{Style.RESET_ALL}"
 
             # DNA 状态
             dna_raw = f"{row['DNA_Raw']:<6}"
@@ -149,7 +154,7 @@ class HistoryViewer:
                 dna_render,
                 p_str,
                 iv_str,
-                d15_render,
+                d10_render, # 这里显示 10m
                 d1h_raw,
                 g_str,
                 f"{Fore.CYAN if row['Score'] >= 70 else Fore.WHITE}{s_str}{Style.RESET_ALL}",
@@ -166,8 +171,8 @@ class HistoryViewer:
         print(f"📡 DNA MOMENTUM RADAR | {df['Time'].iloc[0]}{v_info}")
         print("="*118)
         
-        # 定义表头，确保与 row 数据列数一致
-        headers = ["Time", "Sym", "DNA", "Price", "IV_S", "Δ15m", "Δ1h", "Gamma", "Score", "Gate", "Tag"]
+        # 定义表头，确保与 row 数据列数一致，更新为 Δ10m
+        headers = ["Time", "Sym", "DNA", "Price", "IV_S", "Δ10m", "Δ1h", "Gamma", "Score", "Gate", "Tag"]
         
         # stralign="left" 防止 tabulate 自动居中导致颜色代码错位
         print(tabulate(formatted_rows, headers=headers, tablefmt='psql', stralign="left", disable_numparse=True))

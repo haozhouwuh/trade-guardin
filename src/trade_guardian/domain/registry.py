@@ -8,6 +8,8 @@ from trade_guardian.strategies.hv_calendar import HVCalendarStrategy
 from trade_guardian.strategies.long_gamma import LongGammaStrategy
 from trade_guardian.strategies.diagonal import DiagonalStrategy
 from trade_guardian.strategies.iron_condor import IronCondorStrategy
+from trade_guardian.strategies.vertical_credit import VerticalCreditStrategy
+
 
 class StrategyRegistry:
     def __init__(self, cfg: dict, policy: ShortLegPolicy):
@@ -33,8 +35,13 @@ class StrategyRegistry:
         if n in ("ic", "condor", "iron_condor"):
             return IronCondorStrategy(self.cfg, self.policy)
         
+        # [新增] 垂直价差
+        if n in ("vertical", "pcs", "ccs", "credit_spread"):
+            return VerticalCreditStrategy(self.cfg, self.policy)
+        
+        
         if n in ("auto", "smart", "default"):
             return AutoStrategy(self.cfg, self.policy)
         
-        # 更新报错提示，方便调试
-        raise KeyError(f"Unknown strategy: {name}. Available: calendar, hv, lg, diagonal, ic, auto")
+        # 更新报错信息
+        raise KeyError(f"Unknown strategy: {name}. Available: calendar, hv, lg, diagonal, ic, vertical, auto")
