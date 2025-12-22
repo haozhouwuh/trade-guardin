@@ -66,7 +66,7 @@ class HistoryViewer:
             return df
         finally:
             conn.close()
-            
+
 
     def _process_logic(self, df, latest_id, conn):
         """
@@ -162,16 +162,16 @@ class HistoryViewer:
         v_info = f" | VIX: {df['VIX'].iloc[0]} ({Fore.RED if v_diff > 0 else Fore.GREEN}{v_diff:+0.2f}{Style.RESET_ALL})"
         
         # 调整横线宽度以适配新增的列
-        print("\n" + "="*126)
+        print("\n" + "="*118)
         print(f"📡 DNA MOMENTUM RADAR | {df['Time'].iloc[0]}{v_info}")
-        print("="*126)
+        print("="*118)
         
         # 定义表头，确保与 row 数据列数一致
         headers = ["Time", "Sym", "DNA", "Price", "IV_S", "Δ15m", "Δ1h", "Gamma", "Score", "Gate", "Tag"]
         
         # stralign="left" 防止 tabulate 自动居中导致颜色代码错位
         print(tabulate(formatted_rows, headers=headers, tablefmt='psql', stralign="left", disable_numparse=True))
-        print("\n" + "="*126)
+        print("\n" + "="*118)
 
         
 if __name__ == "__main__":
