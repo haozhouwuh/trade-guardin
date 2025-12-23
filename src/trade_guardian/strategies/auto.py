@@ -45,7 +45,8 @@ class AutoStrategy(Strategy):
         # 1. [倒挂保护] Backwardation -> 强制 Long Gamma (防守)
         if regime == "BACKWARDATION":
             row = self.long_gamma.evaluate(ctx)
-            row.tag = f"AUTO-LG"
+            # [MOD] 移除 AUTO- 前缀，标记为 DEFENSE
+            row.tag = "LG-DEFENSE"
             return row
 
         # 2. [杠杆降维打击] 只要是杠杆 ETF，强制走 Vertical
@@ -53,8 +54,7 @@ class AutoStrategy(Strategy):
         if is_lev_etf:
             row_vert = self.vertical.evaluate(ctx)
             if row_vert and "FAIL" not in (row_vert.tag or ""):
-                base_tag = row_vert.tag or "VERT"
-                row_vert.tag = f"AUTO-{base_tag}"
+                # [MOD] 直接返回 Vertical 策略生成的 Tag (如 BULL-PUT)
                 return row_vert
 
         # 3. [结构优先] Edge > 0.20 -> Diagonal (进攻)
@@ -62,35 +62,36 @@ class AutoStrategy(Strategy):
         if edge_month >= 0.20:
             row_diag = self.diagonal.evaluate(ctx)
             if row_diag and row_diag.meta and "long_strike" in row_diag.meta:
-                row_diag.tag = f"AUTO-DIAG" 
+                # [MOD] 移除 AUTO- 前缀，直接使用 DIAG 本身的 Tag
                 return row_diag
 
         # 4. [高波收租] HV Rank > 30 OR IV > 40% -> Vertical
         if hv_rank > 30 or current_iv > 40.0:
             row_vert = self.vertical.evaluate(ctx)
             if row_vert and "FAIL" not in (row_vert.tag or ""):
-                base_tag = row_vert.tag or "VERT"
-                row_vert.tag = f"AUTO-{base_tag}"
+                # [MOD] 直接返回 Vertical 策略生成的 Tag
                 return row_vert
 
         # 5. [低波博弈] HV < 30 -> Long Gamma
         if hv_rank < 30:
             row = self.long_gamma.evaluate(ctx)
-            row.tag = f"AUTO-LG" 
+            # [MOD] 标记这是低波主要玩法
+            row.tag = "LG-LOWVOL" 
             return row
         
         # 6. [默认兜底] -> Long Gamma
         row = self.long_gamma.evaluate(ctx)
-        row.tag = f"AUTO-LG"
+        row.tag = "LG-BASE"
         return row
 
     def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
         row = self.evaluate(ctx)
         tag = row.tag or ""
         
+        # [MOD] 增加对 BULL/BEAR 等新 Tag 的支持
         if "DIAG" in tag:
             return self.diagonal.recommend(ctx, min_score, max_risk)
-        elif "PCS" in tag or "CCS" in tag or "VERT" in tag:
+        elif "PCS" in tag or "CCS" in tag or "VERT" in tag or "BULL" in tag or "BEAR" in tag:
             return self.vertical.recommend(ctx, min_score, max_risk)
         else:
             return self.long_gamma.recommend(ctx, min_score, max_risk)

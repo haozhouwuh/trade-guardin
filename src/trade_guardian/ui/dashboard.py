@@ -208,9 +208,20 @@ if df is not None:
         "iv_short": st.column_config.NumberColumn("IV", format="%.1f%%"),
     }
 
+    # event = st.dataframe(
+    #     display_df, 
+    #     width="stretch", 
+    #     hide_index=True, 
+    #     column_config=column_cfg, 
+    #     selection_mode="single-row", 
+    #     on_select="rerun", 
+    #     height=700,
+    #     key="radar_master" 
+    # )
     event = st.dataframe(
         display_df, 
-        width="stretch", 
+        width=None,             # <--- 这里控制表格宽度 (像素)
+        use_container_width=True, # <--- 关键！设为 True 会自动撑满右侧窗口
         hide_index=True, 
         column_config=column_cfg, 
         selection_mode="single-row", 

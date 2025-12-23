@@ -13,9 +13,9 @@ class VerticalCreditStrategy(Strategy):
     
     Logic:
       - Directional selling of volatility.
-      - Bull Put Spread (PCS): Sell OTM Put, Buy Lower Put. (Bullish/Neutral)
-      - Bear Call Spread (CCS): Sell OTM Call, Buy Higher Call. (Bearish/Neutral)
-      - Auto-Routing: Detects IV Skew. If Puts are richer (normal in stocks), defaults to PCS.
+      - Bull Put Spread (BULL-PUT): Sell OTM Put, Buy Lower Put. (Bullish/Neutral)
+      - Bear Call Spread (BEAR-CALL): Sell OTM Call, Buy Higher Call. (Bearish/Neutral)
+      - Auto-Routing: Detects IV Skew. If Puts are richer (normal in stocks), defaults to BULL-PUT.
     
     Legs:
       - Short: ~30 Delta (More aggressive than IC's 20)
@@ -86,9 +86,13 @@ class VerticalCreditStrategy(Strategy):
             return self._empty_row(ctx, 0, 99, "DTE < 15")
 
         # 2. 决策方向：Bull Put (PCS) vs Bear Call (CCS)
+        # 目前默认逻辑为 PUT (股票通常 Put Skew 较陡)，后续可根据 Skew 动态调整
         side_short = "PUT"
         side_long = "PUT"
-        strat_tag = "PCS" # Put Credit Spread
+        
+        # [MOD] Tag Renaming: 使用更直观的名称
+        # Put Credit Spread = 看涨/中性 = BULL-PUT
+        strat_tag = "BULL-PUT" if side_short == "PUT" else "BEAR-CALL"
         
         # 3. 寻找腿
         # Vertical 可以比 IC 稍微激进一点，Short Delta 选 0.25 - 0.30
@@ -124,6 +128,10 @@ class VerticalCreditStrategy(Strategy):
         if ror > 0.25: score += 15
         elif ror > 0.15: score += 5
         
+        # [MOD] High Score Highlight
+        if score >= 70:
+            strat_tag += "★"
+        
         # 6. 构建结果
         legs = [
             OrderLeg(ctx.symbol, "SELL", 1, exp, s_strike, side_short),
@@ -144,7 +152,7 @@ class VerticalCreditStrategy(Strategy):
 
         calc_risk = max(0, 100 - score)
 
-        # [FIX] 关键修复：先复制 ctx.tsf (包含 Micro/Month 数据)，再更新 Vertical 独有的 meta
+        # 复制并更新 Meta
         meta_data = ctx.tsf.copy() if ctx.tsf else {}
         meta_data.update({
             "credit": credit, 
@@ -152,12 +160,18 @@ class VerticalCreditStrategy(Strategy):
             "est_gamma": 0.0  # Vertical 的 Gamma 极低，这里硬编码为 0 以通过 Hard Cap
         })
 
+        # [FIX] 关键数据还原：使用 Term Structure 原始短端数据，而不是交易用的 Month Exp
+        # 这样表格显示的 ShortExp / DTE 才是真实的“当前期限结构短端”，而不是交易到期日
+        tsf_short_exp = str(ctx.tsf.get("short_exp", "N/A"))
+        tsf_short_dte = int(ctx.tsf.get("short_dte", 0))
+        tsf_short_iv = float(ctx.tsf.get("short_iv", 0.0))
+
         row = ScanRow(
             symbol=ctx.symbol,
             price=ctx.price,
-            short_exp=exp,
-            short_dte=dte,
-            short_iv=ctx.iv.current_iv,
+            short_exp=tsf_short_exp,  # [FIX] 还原为 TSF 锚点
+            short_dte=tsf_short_dte,  # [FIX] 还原为 TSF 锚点
+            short_iv=tsf_short_iv,    # [FIX] 还原为 TSF 锚点
             base_iv=ctx.tsf.get("month_iv", 0),
             edge=ctx.tsf.get("edge_month", 0),
             hv_rank=hv_rank,
@@ -168,7 +182,7 @@ class VerticalCreditStrategy(Strategy):
             short_risk=int(calc_risk),
             score_breakdown=ScoreBreakdown(base=50),
             risk_breakdown=RiskBreakdown(base=0),
-            meta=meta_data # 使用合并后的 meta
+            meta=meta_data 
         )
         row.blueprint = bp
         return row
