@@ -140,14 +140,13 @@ class SchwabClient:
         return resp.json() if resp.status_code == 200 else {}
 
     # ----------------------------
-    # Term scan (FIXED)
+    # Term scan
     # ----------------------------
 
     def scan_atm_term(self, symbol: str, days: int) -> Tuple[float, List[TermPoint], dict]:
         """
-        目标：扫描 term structure 点用于 TSF 计算。
-        ✅ FIX：每个 expiry 不再只取“最接近现价那一档”，而是取离现价最近的前 N 档，找到第一个 IV>0 的。
-        这样不会把 30-45DTE 批量误杀，避免 month_exp 被 fallback 到 87/98DTE。
+        扫描 term structure 点用于 TSF。
+        每个 expiry：取离现价最近的前 N 档，找到第一个 IV>0 的（避免把 30-45DTE 批量误杀）。
         """
         q = self.get_quote(symbol)
         price = _safe_float(q.get("lastPrice") or q.get("last") or q.get("mark"), 0.0)
@@ -173,7 +172,6 @@ class SchwabClient:
             if not isinstance(strikes_map, dict) or not strikes_map:
                 continue
 
-            # 1) strikes 按离现价距离排序，取前 N 个
             strike_items = list(strikes_map.items())
 
             def _dist(item) -> float:
@@ -189,7 +187,6 @@ class SchwabClient:
             best_data = None
             best_strike = 0.0
 
-            # 2) 在前 N 个里找第一个 iv>0 的
             for s_str, contracts in strike_items:
                 if not contracts:
                     continue
@@ -238,7 +235,8 @@ class SchwabClient:
     def _select_anchor_point(self, term_points: List[TermPoint], short_point: TermPoint) -> TermPoint:
         """
         Anchor（月度锚点）：用于 Edge/Shape 的稳定参考点。
-        默认窗口：anchor_min_dte..anchor_max_dte，fallback 扩到 anchor_fallback_max_dte。
+        ✅ 修正：主窗口里“只要有点”就绝不 fallback 到更远；
+               如果主窗口点数 <3，则不用三点曲率(sd)算法，改为按 target_dte 距离选（并尊重 prefer_monthly）。
         """
         min_dte = int(self._rget("anchor_min_dte", self._rget("month_min_dte", 20)))
         max_dte = int(self._rget("anchor_max_dte", self._rget("month_max_dte", 45)))
@@ -247,22 +245,35 @@ class SchwabClient:
         lam = float(self._rget("anchor_lambda_dist", self._rget("month_lambda_dist", 0.35)))
         prefer_monthly = bool(self._rget("anchor_prefer_monthly", self._rget("month_prefer_monthly", True)))
 
-        pool = [p for p in term_points if min_dte <= p.dte <= max_dte]
-        if len(pool) < 3:
-            pool = [p for p in term_points if min_dte <= p.dte <= fb_max]
+        # 1) 主窗口：只要非空，就坚持在主窗口内选（不因 <3 就扩大窗口）
+        pool = [p for p in term_points if min_dte <= int(p.dte) <= max_dte]
 
-        if len(pool) < 3:
-            # 极端退化：选 dte>=min_dte 中离 target 最近
-            cand = [p for p in term_points if p.dte >= min_dte]
+        # 2) 主窗口为空，才允许 fallback 扩到 fb_max
+        if not pool:
+            pool = [p for p in term_points if min_dte <= int(p.dte) <= fb_max]
+
+        # 3) 仍然没有，就退化：dte>=min_dte 中离 target 最近；再不行就最远
+        if not pool:
+            cand = [p for p in term_points if int(p.dte) >= min_dte]
             if cand:
-                return min(cand, key=lambda p: abs(p.dte - target))
+                return min(cand, key=lambda p: abs(int(p.dte) - target))
             return term_points[-1]
 
+        # 4) 如果点数不足 3：无法做三点 sd，直接按 target 距离（可选 prefer_monthly）
+        if len(pool) < 3:
+            candidates = pool
+            if prefer_monthly:
+                monthly = [p for p in candidates if get_series_kind(p.exp) == "MONTHLY"]
+                if monthly:
+                    candidates = monthly
+            return min(candidates, key=lambda p: abs(int(p.dte) - target))
+
+        # 5) 点数足够：用三点窗口 sd + 距离惩罚
         scored: List[Tuple[float, float, TermPoint]] = []
         for i in range(1, len(pool) - 1):
             window = [pool[i - 1].iv, pool[i].iv, pool[i + 1].iv]
             sd = float(np.std(window))
-            dist_penalty = abs(pool[i].dte - target) / max(1.0, target)
+            dist_penalty = abs(int(pool[i].dte) - target) / max(1.0, target)
             score = sd + (lam * dist_penalty)
             scored.append((score, sd, pool[i]))
 
@@ -279,7 +290,6 @@ class SchwabClient:
         """
         对角线 long leg：交易用真实长腿。
         ✅ 强约束：long_dte >= short_dte + diag_long_min_gap_vs_short
-        默认窗口：diag_long_min_dte..diag_long_max_dte，fallback 扩到 diag_long_fallback_max_dte。
         """
         min_dte = int(self._rget("diag_long_min_dte", 45))
         max_dte = int(self._rget("diag_long_max_dte", 75))
@@ -289,24 +299,25 @@ class SchwabClient:
         prefer_monthly = bool(self._rget("diag_long_prefer_monthly", False))
         min_gap = int(self._rget("diag_long_min_gap_vs_short", 20))
 
-        min_needed = short_point.dte + max(0, min_gap)
+        min_needed = int(short_point.dte) + max(0, min_gap)
 
         def eligible(p: TermPoint, hi: int) -> bool:
-            return (min_dte <= p.dte <= hi) and (p.dte >= min_needed)
+            return (min_dte <= int(p.dte) <= hi) and (int(p.dte) >= min_needed)
 
         pool = [p for p in term_points if eligible(p, max_dte)]
         if len(pool) < 3:
             pool = [p for p in term_points if eligible(p, fb_max)]
 
         if not pool:
-            # 退化：找所有 >= min_needed 的里离 target 最近；再不行就最远
-            cand = [p for p in term_points if p.dte >= min_needed]
+            cand = [p for p in term_points if int(p.dte) >= min_needed]
             if cand:
-                return min(cand, key=lambda p: abs(p.dte - target))
+                return min(cand, key=lambda p: abs(int(p.dte) - target))
             return term_points[-1]
 
-        # 用“距离 target 最小”为主，prefer_monthly 可选
-        pool_sorted = sorted(pool, key=lambda p: abs(p.dte - target) + lam * abs(p.dte - target) / max(1.0, target))
+        pool_sorted = sorted(
+            pool,
+            key=lambda p: abs(int(p.dte) - target) + lam * abs(int(p.dte) - target) / max(1.0, target),
+        )
         top = pool_sorted[: min(8, len(pool_sorted))]
         if prefer_monthly:
             for p in top:
@@ -316,42 +327,40 @@ class SchwabClient:
 
     def build_context(self, symbol: str, days: int = 600) -> Optional[Context]:
         try:
-            # 1) HV
             hv_info = self.calculate_hv_percentile(symbol)
             if getattr(hv_info, "status", "") == "Error":
                 hv_info = HVInfo(current_hv=0.0, hv_rank=50.0)
 
-            # 2) Chain + term points
             price, term_points, raw_chain = self.scan_atm_term(symbol, days)
             if not term_points or len(term_points) < 3:
                 return None
-            term_points.sort(key=lambda x: x.dte)
+            term_points.sort(key=lambda x: int(x.dte))
 
-            # 3) IV 单位 heuristic：<1.5 视为小数 (0.32 => 32%)
+            # IV 单位 heuristic：<1.5 视为小数 (0.32 => 32%)
             for p in term_points:
-                if 0 < p.iv < 1.5:
+                if 0 < float(p.iv) < 1.5:
                     p.iv *= 100.0
 
             # -----------------------------------------
             # A) Short leg selection (1..15d)
             # -----------------------------------------
-            nearest_candidates = [p for p in term_points if p.dte >= 1]
+            nearest_candidates = [p for p in term_points if int(p.dte) >= 1]
             nearest_point = nearest_candidates[0] if nearest_candidates else term_points[0]
 
             base_rank = int(self.cfg.get("policy", {}).get("base_rank", 1) or 1)
-            short_pool = [p for p in term_points if 1 <= p.dte <= 15]
+            short_pool = [p for p in term_points if 1 <= int(p.dte) <= 15]
             if short_pool:
                 short_point = short_pool[base_rank] if len(short_pool) > base_rank else short_pool[-1]
             else:
                 short_point = nearest_point
 
-            short_iv_base = short_point.iv if short_point.iv > 0 else 1.0
-            nearest_iv_base = nearest_point.iv if nearest_point.iv > 0 else 1.0
+            short_iv_base = float(short_point.iv) if float(short_point.iv) > 0 else 1.0
+            nearest_iv_base = float(nearest_point.iv) if float(nearest_point.iv) > 0 else 1.0
 
             # -----------------------------------------
             # B) Micro anchor (1..15d)
             # -----------------------------------------
-            micro_pool = [p for p in term_points if 1 <= p.dte <= 15]
+            micro_pool = [p for p in term_points if 1 <= int(p.dte) <= 15]
             micro_point = None
 
             if len(micro_pool) >= 2:
@@ -364,8 +373,8 @@ class SchwabClient:
                     micro_point = max(local_maxima, key=lambda x: x.iv)
                 else:
                     def _momentum_score(p: TermPoint) -> float:
-                        d_eff = max(1, p.dte)
-                        return (p.iv - nearest_iv_base) / np.sqrt(d_eff)
+                        d_eff = max(1, int(p.dte))
+                        return (float(p.iv) - nearest_iv_base) / np.sqrt(d_eff)
                     micro_point = max(micro_pool, key=_momentum_score)
 
             if not micro_point:
@@ -378,52 +387,50 @@ class SchwabClient:
             diag_long_point = self._select_diag_long_point(term_points, short_point)
 
             # -----------------------------------------
-            # 4) Assemble TSF
+            # Assemble TSF
             # -----------------------------------------
             IV_FLOOR = 12.0
 
-            # regime/curvature 仍然用 anchor_point 作为“月度锚”
             regime = "FLAT"
-            if short_point.iv > anchor_point.iv * 1.03:
+            if float(short_point.iv) > float(anchor_point.iv) * 1.03:
                 regime = "BACKWARDATION"
-            elif anchor_point.iv > short_point.iv * 1.03:
+            elif float(anchor_point.iv) > float(short_point.iv) * 1.03:
                 regime = "CONTANGO"
 
-            curvature = "SPIKY_FRONT" if micro_point.iv > short_point.iv * 1.10 else "NORMAL"
-            is_squeeze = True if (micro_point.iv > anchor_point.iv * 1.05) else False
+            curvature = "SPIKY_FRONT" if float(micro_point.iv) > float(short_point.iv) * 1.10 else "NORMAL"
+            is_squeeze = True if (float(micro_point.iv) > float(anchor_point.iv) * 1.05) else False
 
             tsf = {
                 "regime": regime,
                 "curvature": curvature,
                 "is_squeeze": is_squeeze,
 
-                # short / nearest / micro
                 "short_exp": short_point.exp,
-                "short_dte": short_point.dte,
-                "short_iv": short_point.iv,
+                "short_dte": int(short_point.dte),
+                "short_iv": float(short_point.iv),
+
                 "nearest_exp": nearest_point.exp,
-                "nearest_dte": nearest_point.dte,
-                "nearest_iv": nearest_point.iv,
+                "nearest_dte": int(nearest_point.dte),
+                "nearest_iv": float(nearest_point.iv),
+
                 "micro_exp": micro_point.exp,
-                "micro_dte": micro_point.dte,
-                "micro_iv": micro_point.iv,
+                "micro_dte": int(micro_point.dte),
+                "micro_iv": float(micro_point.iv),
 
-                # ✅ month_* = Anchor（结构锚点）
+                # month_* = Anchor（结构锚点）
                 "month_exp": anchor_point.exp,
-                "month_dte": anchor_point.dte,
-                "month_iv": anchor_point.iv,
+                "month_dte": int(anchor_point.dte),
+                "month_iv": float(anchor_point.iv),
 
-                # ✅ diag_long_* = 交易用 long leg
+                # diag_long_* = 交易用 long leg
                 "diag_long_exp": diag_long_point.exp,
-                "diag_long_dte": diag_long_point.dte,
-                "diag_long_iv": diag_long_point.iv,
+                "diag_long_dte": int(diag_long_point.dte),
+                "diag_long_iv": float(diag_long_point.iv),
 
-                # edges 使用 anchor_point
-                "edge_micro": (micro_point.iv - short_point.iv) / max(IV_FLOOR, short_point.iv),
-                "edge_month": (anchor_point.iv - short_point.iv) / max(IV_FLOOR, short_point.iv),
+                "edge_micro": (float(micro_point.iv) - float(short_point.iv)) / max(IV_FLOOR, float(short_point.iv)),
+                "edge_month": (float(anchor_point.iv) - float(short_point.iv)) / max(IV_FLOOR, float(short_point.iv)),
             }
 
-            # 5) Build Context objects
             iv_data = IVData(
                 rank=float(hv_info.hv_rank),
                 percentile=0.0,
