@@ -45,15 +45,50 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
 
 def _pick_iv(quote_obj: Dict[str, Any]) -> float:
     """
-    Schwab API 在不同端点/字段可能有差异：优先兼容多个 key。
-    注意：这里拿到的可能是 0.32 (32%) 或 32.0 (32%)，单位统一在 build_context 里做 heuristic。
+    Schwab chain contract:
+      - volatility: 通常就是 IV（但 deep ITM/OTM 或 DTE<1 时可能失真到几百%）
+      - theoreticalVolatility: Schwab 用于理论价的平滑波动率（常更稳定）
+
+    规则（按你给的说明）：
+      1) 优先 volatility
+      2) 若 |delta|>0.90 或 <0.10，或 DTE<1，且 volatility 离谱(>100% 或 <1%)，
+         且 theoreticalVolatility 正常，则回退 theoreticalVolatility
+      3) volatility 缺失/为0 时，再尝试 impliedVolatility 等字段
     """
-    for k in ("volatility", "impliedVolatility", "iv", "impliedVol"):
-        v = quote_obj.get(k, None)
-        iv = _safe_float(v, 0.0)
-        if iv > 0:
-            return iv
-    return 0.0
+    raw_iv = _safe_float(quote_obj.get("volatility", None), 0.0)
+    theo_iv = _safe_float(quote_obj.get("theoreticalVolatility", None), 0.0)
+
+    delta = abs(_safe_float(quote_obj.get("delta", None), 0.0))
+    dte = _safe_float(quote_obj.get("daysToExpiration", None), -1.0)  # chain 里一般有
+
+    # 用与你 build_context 相同的 heuristic 转成“百分比尺度”来判断是否离谱
+    def _as_pct(v: float) -> float:
+        if 0 < v < 1.5:
+            return v * 100.0
+        return v
+
+    raw_iv_pct = _as_pct(raw_iv)
+    theo_iv_pct = _as_pct(theo_iv)
+
+    extreme_delta = (delta > 0.90) or (0 < delta < 0.10)
+    very_short_dte = (dte >= 0 and dte < 1)
+
+    # 如果 volatility 缺失/为 0：先尝试其他 iv 字段
+    if raw_iv <= 0:
+        for k in ("impliedVolatility", "impliedVol", "iv"):
+            v = _safe_float(quote_obj.get(k, None), 0.0)
+            if v > 0:
+                raw_iv = v
+                raw_iv_pct = _as_pct(raw_iv)
+                break
+
+    # 关键清洗逻辑：deep ITM/OTM 或 DTE<1 时，volatility 可能反推崩溃
+    if (extreme_delta or very_short_dte) and theo_iv > 0:
+        if (raw_iv_pct > 100.0) or (0 < raw_iv_pct < 1.0):
+            return theo_iv  # theo_iv 通常更稳定
+
+    # 正常情况下：返回 volatility（或其 fallback 的 impliedVolatility）
+    return raw_iv if raw_iv > 0 else 0.0
 
 
 def _pick_mark(quote_obj: Dict[str, Any]) -> float:
@@ -245,21 +280,17 @@ class SchwabClient:
         lam = float(self._rget("anchor_lambda_dist", self._rget("month_lambda_dist", 0.35)))
         prefer_monthly = bool(self._rget("anchor_prefer_monthly", self._rget("month_prefer_monthly", True)))
 
-        # 1) 主窗口：只要非空，就坚持在主窗口内选（不因 <3 就扩大窗口）
         pool = [p for p in term_points if min_dte <= int(p.dte) <= max_dte]
 
-        # 2) 主窗口为空，才允许 fallback 扩到 fb_max
         if not pool:
             pool = [p for p in term_points if min_dte <= int(p.dte) <= fb_max]
 
-        # 3) 仍然没有，就退化：dte>=min_dte 中离 target 最近；再不行就最远
         if not pool:
             cand = [p for p in term_points if int(p.dte) >= min_dte]
             if cand:
                 return min(cand, key=lambda p: abs(int(p.dte) - target))
             return term_points[-1]
 
-        # 4) 如果点数不足 3：无法做三点 sd，直接按 target 距离（可选 prefer_monthly）
         if len(pool) < 3:
             candidates = pool
             if prefer_monthly:
@@ -268,7 +299,6 @@ class SchwabClient:
                     candidates = monthly
             return min(candidates, key=lambda p: abs(int(p.dte) - target))
 
-        # 5) 点数足够：用三点窗口 sd + 距离惩罚
         scored: List[Tuple[float, float, TermPoint]] = []
         for i in range(1, len(pool) - 1):
             window = [pool[i - 1].iv, pool[i].iv, pool[i + 1].iv]
@@ -336,14 +366,10 @@ class SchwabClient:
                 return None
             term_points.sort(key=lambda x: int(x.dte))
 
-            # IV 单位 heuristic：<1.5 视为小数 (0.32 => 32%)
             for p in term_points:
                 if 0 < float(p.iv) < 1.5:
                     p.iv *= 100.0
 
-            # -----------------------------------------
-            # A) Short leg selection (1..15d)
-            # -----------------------------------------
             nearest_candidates = [p for p in term_points if int(p.dte) >= 1]
             nearest_point = nearest_candidates[0] if nearest_candidates else term_points[0]
 
@@ -354,12 +380,8 @@ class SchwabClient:
             else:
                 short_point = nearest_point
 
-            short_iv_base = float(short_point.iv) if float(short_point.iv) > 0 else 1.0
             nearest_iv_base = float(nearest_point.iv) if float(nearest_point.iv) > 0 else 1.0
 
-            # -----------------------------------------
-            # B) Micro anchor (1..15d)
-            # -----------------------------------------
             micro_pool = [p for p in term_points if 1 <= int(p.dte) <= 15]
             micro_point = None
 
@@ -380,15 +402,9 @@ class SchwabClient:
             if not micro_point:
                 micro_point = short_point
 
-            # -----------------------------------------
-            # C) Anchor point (structure) + DiagLong point (trade)
-            # -----------------------------------------
             anchor_point = self._select_anchor_point(term_points, short_point)
             diag_long_point = self._select_diag_long_point(term_points, short_point)
 
-            # -----------------------------------------
-            # Assemble TSF
-            # -----------------------------------------
             IV_FLOOR = 12.0
 
             regime = "FLAT"
@@ -417,12 +433,10 @@ class SchwabClient:
                 "micro_dte": int(micro_point.dte),
                 "micro_iv": float(micro_point.iv),
 
-                # month_* = Anchor（结构锚点）
                 "month_exp": anchor_point.exp,
                 "month_dte": int(anchor_point.dte),
                 "month_iv": float(anchor_point.iv),
 
-                # diag_long_* = 交易用 long leg
                 "diag_long_exp": diag_long_point.exp,
                 "diag_long_dte": int(diag_long_point.dte),
                 "diag_long_iv": float(diag_long_point.iv),
