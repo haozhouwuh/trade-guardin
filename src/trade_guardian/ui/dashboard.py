@@ -30,9 +30,6 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    /* 侧边栏宽度强行锁定 450px */
-    [data-testid="stSidebar"] { min-width: 450px !important; max-width: 450px !important; }
-    
     /* 进度条颜色 */
     .stProgress > div > div > div > div { background-color: #f63366; }
     
@@ -84,6 +81,7 @@ def get_sniper():
     cfg = load_config(cfg_path, DEFAULT_CONFIG)
     return Sniper(SchwabClient(cfg))
 
+# [辅助] 获取历史批次ID
 def get_past_batch_id(conn, current_ts_str, minutes_ago):
     try:
         curr_dt = datetime.strptime(current_ts_str, "%Y-%m-%d %H:%M:%S")
@@ -94,6 +92,8 @@ def get_past_batch_id(conn, current_ts_str, minutes_ago):
         return None
     except: return None
 
+# [核心] 带缓存的数据加载
+@st.cache_data(ttl=10)
 def load_radar_with_deltas():
     db_path = os.path.join(project_root, "db", "trade_guardian.db")
     if not os.path.exists(db_path): return None, None
@@ -167,7 +167,9 @@ if df is not None:
     col2.metric("Scan Time", ts.split(" ")[1]) 
     col3.metric("Candidates", len(df))
     
-    if col4.button("🔄 Refresh"): st.rerun()
+    if col4.button("🔄 Refresh"): 
+        load_radar_with_deltas.clear()
+        st.rerun()
     
     auto_ref = col5.checkbox("Auto (5min)", value=st.session_state.auto_refresh)
     st.session_state.auto_refresh = auto_ref
@@ -175,31 +177,20 @@ if df is not None:
     # --- 主表格 (Radar) ---
     display_df = df.copy()
     
-    # [FIX 1] 显式重命名列，找回希腊字母 Δ
-    display_df = display_df.rename(columns={
-        "d_10m": "Δ10m",
-        "d_1h": "Δ1h"
-    })
-    
-    # [NEW] 使用 Pandas Styler 为 Δ10m 和 Δ1h 上色
-    def color_delta(val):
-        color = '#00c853' if val > 0 else '#f44336' if val < 0 else '#888'
-        return f'color: {color}'
+    # Emoji 字符串处理
+    def format_delta(val):
+        if val > 0: return f"🟢 +{val:.2f}"
+        elif val < 0: return f"🔴 {val:.2f}"
+        else: return f"⚪ {val:.2f}"
 
-    # 先筛选列 (注意这里要用新的列名)
-    cols = ['symbol', 'price', 'Δ10m', 'Δ1h', 'iv_short', 'edge', 'regime', 'strategy_type', 'tag', 'cal_score', 'gate_status', 'blueprint_json']
+    display_df['Δ10m'] = display_df['d_10m'].apply(format_delta)
+    display_df['Δ1h'] = display_df['d_1h'].apply(format_delta)
+    
+    # [MODIFIED] 调整列顺序：将 'cal_score' (Score) 移到最右侧
+    cols = ['symbol', 'price', 'Δ10m', 'Δ1h', 'iv_short', 'edge', 'regime', 'strategy_type', 'tag', 'gate_status', 'cal_score', 'blueprint_json']
     cols = [c for c in cols if c in display_df.columns]
     display_df = display_df[cols]
     
-    # 应用样式
-    styled_df = display_df.style.format({
-        "price": "${:.2f}",
-        "Δ10m": "{:+.2f}",
-        "Δ1h": "{:+.2f}",
-        "edge": "{:.2f}",
-        "iv_short": "{:.1f}%",
-    }).map(color_delta, subset=['Δ10m', 'Δ1h'])
-
     column_cfg = {
         "blueprint_json": None, 
         "cal_score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
@@ -207,19 +198,19 @@ if df is not None:
     }
 
     event = st.dataframe(
-        styled_df, # 传入带有颜色的 Styler 对象
+        display_df, 
         width="stretch", 
         hide_index=True, 
         column_config=column_cfg, 
         selection_mode="single-row", 
         on_select="rerun", 
-        height=550
+        height=550,
+        key="radar_master" 
     )
     
     # --- 侧边栏 ---
     if len(event.selection.rows) > 0:
         selected_index = event.selection.rows[0]
-        # 注意：这里要用原始的 df 来获取数据，因为 display_df 列名变了
         row = df.iloc[selected_index]
         symbol = row['symbol']
         bp_json_raw = row['blueprint_json']
@@ -291,14 +282,17 @@ if df is not None:
             with c2:
                 if st.button("🔄"): st.rerun()
 
+    else:
+        # [UX] 如果没选中，侧边栏保持空或显示提示
+        with st.sidebar:
+             st.info("👈 Select a target from the radar.")
+
 else:
     st.warning("⚠️ No scan data found. Please run `python src/trade_guardian.py scanlist` first.")
 
-# [FIX 2] 使用倒计时循环替代死睡，解决 Ctrl+C 无法退出
+# 倒计时循环
 if auto_ref:
-    # 底部倒计时条
     countdown_box = st.empty()
-    # 300秒倒计时，每1秒检查一次
     for i in range(300, 0, -5):
         countdown_box.caption(f"⏳ Auto-refresh in **{i}** seconds...")
         time.sleep(5)
