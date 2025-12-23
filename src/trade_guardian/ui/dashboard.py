@@ -22,28 +22,24 @@ from trade_guardian.action.sniper import Sniper
 # 2. 页面配置 & CSS
 # ==========================================
 st.set_page_config(
-    page_title="Trade Guardian", 
-    page_icon="🛡️", 
+    page_title="Trade Guardian",
+    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# [FIX] 初始化 Session State 中的刷新时间锚点
-if 'last_refresh_time' not in st.session_state:
+if "last_refresh_time" not in st.session_state:
     st.session_state.last_refresh_time = time.time()
 
-st.markdown("""
+st.markdown(
+    """
 <style>
-    /* 去除顶部大片空白 */
     .block-container {
         padding-top: 1rem !important;
         padding-bottom: 1rem !important;
     }
-    
-    /* 进度条颜色 */
     .stProgress > div > div > div > div { background-color: #f63366; }
-    
-    /* 侧边栏头部信息条 */
+
     .sidebar-header {
         display: flex; justify-content: space-between; align-items: center;
         background-color: #262730; padding: 10px 5px; border-radius: 6px; border: 1px solid #444; margin-bottom: 15px;
@@ -53,7 +49,6 @@ st.markdown("""
     .header-label { font-size: 0.7rem; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
     .header-value { font-size: 1rem; font-weight: 700; color: #eee; white-space: nowrap; }
 
-    /* 蓝图 Box */
     .blueprint-box {
         font-size: 0.85rem; background-color: #1e1e1e; border: 1px solid #333;
         border-radius: 4px; padding: 8px 12px; margin-bottom: 6px;
@@ -62,7 +57,6 @@ st.markdown("""
     .leg-buy { border-left: 4px solid #00c853; }
     .leg-sell { border-left: 4px solid #f44336; }
 
-    /* 计算结果大屏 (LCD风格) */
     .calc-box {
         background-color: #0e1117; border: 1px solid #4caf50; border-radius: 8px;
         padding: 15px; text-align: center; margin-top: 15px; margin-bottom: 15px;
@@ -78,69 +72,115 @@ st.markdown("""
         border-radius: 4px; flex: 1; text-align: center; justify-content: center;
     }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True
+)
 
 # ==========================================
 # 3. 核心逻辑
 # ==========================================
 
+def _pick_cfg_path() -> str | None:
+    candidates = [
+        os.path.join(project_root, "config", "config.yaml"),
+        os.path.join(project_root, "config", "config.yml"),
+        os.path.join(project_root, "config", "config.json"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
 @st.cache_resource
 def get_sniper():
-    cfg_path = os.path.join(project_root, "config", "config.json")
-    if not os.path.exists(cfg_path): return None
+    cfg_path = _pick_cfg_path()
+    if not cfg_path:
+        return None
     cfg = load_config(cfg_path, DEFAULT_CONFIG)
     return Sniper(SchwabClient(cfg))
+
 
 def get_past_batch_id(conn, current_ts_str, minutes_ago):
     try:
         curr_dt = datetime.strptime(current_ts_str, "%Y-%m-%d %H:%M:%S")
         target_dt = curr_dt - timedelta(minutes=minutes_ago)
         target_str = target_dt.strftime("%Y-%m-%d %H:%M:%S")
-        row = conn.execute("SELECT batch_id, timestamp FROM scan_batches WHERE timestamp <= ? ORDER BY batch_id DESC LIMIT 1", (target_str,)).fetchone()
-        if row: return row[0]
+        row = conn.execute(
+            "SELECT batch_id, timestamp FROM scan_batches WHERE timestamp <= ? ORDER BY batch_id DESC LIMIT 1",
+            (target_str,)
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
         return None
-    except: return None
+
 
 @st.cache_data(ttl=10)
 def load_radar_with_deltas():
     db_path = os.path.join(project_root, "db", "trade_guardian.db")
-    if not os.path.exists(db_path): return None, None
+    if not os.path.exists(db_path):
+        return None, None
 
     conn = sqlite3.connect(db_path)
     try:
-        curr_batch = conn.execute("SELECT batch_id, timestamp, market_vix FROM scan_batches ORDER BY batch_id DESC LIMIT 1").fetchone()
-        if not curr_batch: return None, None
+        curr_batch = conn.execute(
+            "SELECT batch_id, timestamp, market_vix FROM scan_batches ORDER BY batch_id DESC LIMIT 1"
+        ).fetchone()
+        if not curr_batch:
+            return None, None
         curr_id, curr_ts, vix = curr_batch
-        
+
         id_10m = get_past_batch_id(conn, curr_ts, 10)
         id_1h = get_past_batch_id(conn, curr_ts, 60)
-        
+
+        # ✅ NEW: rank_score 用于排序（WAIT 罚分），但 UI 仍显示 cal_score
+        # 你可以随时调整这些常数：WAIT 更靠后就把 -40 改成 -80 等。
         query_main = """
-            SELECT s.symbol, s.price, s.iv_short, s.edge, s.regime, p.strategy_type, p.tag, p.cal_score, p.gate_status, p.blueprint_json
-            FROM market_snapshots s JOIN trade_plans p ON s.snapshot_id = p.snapshot_id
-            WHERE s.batch_id = ? ORDER BY p.cal_score DESC
+            SELECT
+                s.symbol, s.price, s.iv_short, s.edge, s.regime,
+                p.strategy_type, p.tag, p.cal_score, p.gate_status, p.blueprint_json,
+                (p.cal_score + CASE p.gate_status
+                    WHEN 'EXEC'   THEN 120
+                    WHEN 'LIMIT'  THEN 40
+                    WHEN 'WAIT'   THEN -40
+                    WHEN 'FORBID' THEN -200
+                    ELSE -60
+                END) AS rank_score
+            FROM market_snapshots s
+            JOIN trade_plans p ON s.snapshot_id = p.snapshot_id
+            WHERE s.batch_id = ?
+            ORDER BY rank_score DESC, p.cal_score DESC
         """
         df = pd.read_sql_query(query_main, conn, params=(curr_id,))
-        
-        df['d_10m'] = 0.0
-        df['d_1h'] = 0.0
-        
-        if id_10m:
-            df_10 = pd.read_sql_query("SELECT symbol, price FROM market_snapshots WHERE batch_id = ?", conn, params=(id_10m,))
-            merged = df.merge(df_10, on='symbol', how='left', suffixes=('', '_old'))
-            df['d_10m'] = merged['price'] - merged['price_old']
-            
-        if id_1h:
-            df_1h = pd.read_sql_query("SELECT symbol, price FROM market_snapshots WHERE batch_id = ?", conn, params=(id_1h,))
-            merged = df.merge(df_1h, on='symbol', how='left', suffixes=('', '_old'))
-            df['d_1h'] = merged['price'] - merged['price_old']
 
-        df['d_10m'] = df['d_10m'].fillna(0.0)
-        df['d_1h'] = df['d_1h'].fillna(0.0)
-        
+        df["d_10m"] = 0.0
+        df["d_1h"] = 0.0
+
+        if id_10m:
+            df_10 = pd.read_sql_query(
+                "SELECT symbol, price FROM market_snapshots WHERE batch_id = ?",
+                conn,
+                params=(id_10m,)
+            )
+            merged = df.merge(df_10, on="symbol", how="left", suffixes=("", "_old"))
+            df["d_10m"] = merged["price"] - merged["price_old"]
+
+        if id_1h:
+            df_1h = pd.read_sql_query(
+                "SELECT symbol, price FROM market_snapshots WHERE batch_id = ?",
+                conn,
+                params=(id_1h,)
+            )
+            merged = df.merge(df_1h, on="symbol", how="left", suffixes=("", "_old"))
+            df["d_1h"] = merged["price"] - merged["price_old"]
+
+        df["d_10m"] = df["d_10m"].fillna(0.0)
+        df["d_1h"] = df["d_1h"].fillna(0.0)
+
         return df, (curr_ts, vix)
     finally:
         conn.close()
+
 
 # ==========================================
 # 4. 界面渲染
@@ -148,7 +188,7 @@ def load_radar_with_deltas():
 
 st.title("🛡️ Trade Guardian Command Center")
 
-if 'auto_refresh' not in st.session_state:
+if "auto_refresh" not in st.session_state:
     st.session_state.auto_refresh = True
 
 df, metadata = load_radar_with_deltas()
@@ -156,51 +196,67 @@ auto_ref = False
 
 if df is not None:
     ts, vix = metadata
-    
+
     vix_val = float(vix)
-    vix_label = "NORMAL"; vix_color = "#ffd700" 
-    if vix_val < 15: vix_color = "#00c853"; vix_label = "LOW"
-    elif vix_val >= 20 and vix_val < 25: vix_color = "#ff9800"; vix_label = "ELEVATED"
-    elif vix_val >= 25: vix_color = "#f44336"; vix_label = "PANIC"
+    vix_label = "NORMAL"
+    vix_color = "#ffd700"
+    if vix_val < 15:
+        vix_color = "#00c853"
+        vix_label = "LOW"
+    elif 20 <= vix_val < 25:
+        vix_color = "#ff9800"
+        vix_label = "ELEVATED"
+    elif vix_val >= 25:
+        vix_color = "#f44336"
+        vix_label = "PANIC"
 
     col1, col2, col3, col4, col5 = st.columns([1.5, 1.5, 1.5, 1, 1])
-    
-    col1.markdown(f"""
+
+    col1.markdown(
+        f"""
         <div style="background-color: #262730; padding: 10px; border-radius: 5px; border-left: 5px solid {vix_color};">
             <div style="font-size: 0.8rem; color: #aaa;">MARKET VIX</div>
             <div style="font-size: 1.5rem; font-weight: bold; color: white;">{vix:.2f} <span style="font-size:0.8rem; color:{vix_color}">({vix_label})</span></div>
         </div>
-    """, unsafe_allow_html=True)
-    
-    col2.metric("Scan Time", ts.split(" ")[1]) 
+        """,
+        unsafe_allow_html=True
+    )
+
+    col2.metric("Scan Time", ts.split(" ")[1])
     col3.metric("Candidates", len(df))
-    
-    # [FIX] 手动刷新时，必须更新时间锚点
-    if col4.button("🔄 Refresh"): 
+
+    if col4.button("🔄 Refresh"):
         load_radar_with_deltas.clear()
-        st.session_state.last_refresh_time = time.time() # 重置计时器
+        st.session_state.last_refresh_time = time.time()
         st.rerun()
-    
+
     auto_ref = col5.checkbox("Auto (5min)", value=st.session_state.auto_refresh)
     st.session_state.auto_refresh = auto_ref
-    
+
     # --- 主表格 ---
     display_df = df.copy()
-    
-    def format_delta(val):
-        if val > 0: return f"🟢 +{val:.2f}"
-        elif val < 0: return f"🔴 {val:.2f}"
-        else: return f"⚪ {val:.2f}"
 
-    display_df['Δ10m'] = display_df['d_10m'].apply(format_delta)
-    display_df['Δ1h'] = display_df['d_1h'].apply(format_delta)
-    
-    cols = ['symbol', 'price', 'Δ10m', 'Δ1h', 'iv_short', 'edge', 'regime', 'strategy_type', 'tag', 'gate_status', 'cal_score', 'blueprint_json']
+    def format_delta(val):
+        if val > 0:
+            return f"🟢 +{val:.2f}"
+        elif val < 0:
+            return f"🔴 {val:.2f}"
+        else:
+            return f"⚪ {val:.2f}"
+
+    display_df["Δ10m"] = display_df["d_10m"].apply(format_delta)
+    display_df["Δ1h"] = display_df["d_1h"].apply(format_delta)
+
+    # 注意：rank_score 不展示，只用于排序（已经在 SQL 里排好了）
+    cols = [
+        "symbol", "price", "Δ10m", "Δ1h", "iv_short", "edge", "regime",
+        "strategy_type", "tag", "gate_status", "cal_score", "blueprint_json"
+    ]
     cols = [c for c in cols if c in display_df.columns]
     display_df = display_df[cols]
-    
+
     column_cfg = {
-        "blueprint_json": None, 
+        "blueprint_json": None,
         "cal_score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
         "symbol": st.column_config.TextColumn("Symbol", width="small"),
         "price": st.column_config.NumberColumn("Price", format="$%.2f"),
@@ -208,50 +264,43 @@ if df is not None:
         "iv_short": st.column_config.NumberColumn("IV", format="%.1f%%"),
     }
 
-    # event = st.dataframe(
-    #     display_df, 
-    #     width="stretch", 
-    #     hide_index=True, 
-    #     column_config=column_cfg, 
-    #     selection_mode="single-row", 
-    #     on_select="rerun", 
-    #     height=700,
-    #     key="radar_master" 
-    # )
     event = st.dataframe(
-        display_df, 
-        width=None,             # <--- 这里控制表格宽度 (像素)
-        use_container_width=True, # <--- 关键！设为 True 会自动撑满右侧窗口
-        hide_index=True, 
-        column_config=column_cfg, 
-        selection_mode="single-row", 
-        on_select="rerun", 
+        display_df,
+        width="stretch",
+        hide_index=True,
+        column_config=column_cfg,
+        selection_mode="single-row",
+        on_select="rerun",
         height=700,
-        key="radar_master" 
+        key="radar_master"
     )
-    
+
     # --- 侧边栏 ---
     if len(event.selection.rows) > 0:
         selected_index = event.selection.rows[0]
         row = df.iloc[selected_index]
-        symbol = row['symbol']
-        bp_json_raw = row['blueprint_json']
-        
+        symbol = row["symbol"]
+        bp_json_raw = row["blueprint_json"]
+
         with st.sidebar:
             st.markdown(f"## 🔭 Scope: **{symbol}**")
-            
-            gate_color = "#00c853" if row['gate_status'] == "EXEC" else ("#ffeb3b" if row['gate_status'] == "LIMIT" else "#f44336")
-            
-            # 使用全名
-            strat_display = row['strategy_type']
-            
-            st.markdown(f"""
-            <div class="sidebar-header">
-                <div class="header-item"><div class="header-label">STRATEGY</div><div class="header-value">{strat_display}</div></div>
-                <div class="header-item"><div class="header-label">TAG</div><div class="header-value">{row['tag']}</div></div>
-                <div class="header-item"><div class="header-label">GATE</div><div class="header-value" style="color: {gate_color};">{row['gate_status']}</div></div>
-            </div>
-            """, unsafe_allow_html=True)
+
+            gate_color = "#00c853" if row["gate_status"] == "EXEC" else (
+                "#ffeb3b" if row["gate_status"] == "LIMIT" else "#f44336"
+            )
+
+            strat_display = row["strategy_type"]
+
+            st.markdown(
+                f"""
+                <div class="sidebar-header">
+                    <div class="header-item"><div class="header-label">STRATEGY</div><div class="header-value">{strat_display}</div></div>
+                    <div class="header-item"><div class="header-label">TAG</div><div class="header-value">{row['tag']}</div></div>
+                    <div class="header-item"><div class="header-label">GATE</div><div class="header-value" style="color: {gate_color};">{row['gate_status']}</div></div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
             bp_valid = False
             short_exp, short_strike = None, 0.0
@@ -264,77 +313,106 @@ if df is not None:
                     legs = bp_data.get("legs", [])
                     if legs:
                         bp_valid = True
-                        if "DIAGONAL" in row['strategy_type'].upper() or "DIAGONAL" in str(row['tag']).upper():
+                        if "DIAGONAL" in str(row["strategy_type"]).upper() or "DIAGONAL" in str(row["tag"]).upper():
                             target_strategy = "DIAGONAL"
                             for leg in legs:
-                                cls = "leg-buy" if leg['action'] == "BUY" else "leg-sell"
-                                icon = "🟢" if leg['action'] == "BUY" else "🔴"
-                                st.markdown(f"""<div class="blueprint-box {cls}"><span>{icon} <b>{leg['action']} {leg['ratio']}x</b></span><span>{leg['exp']}</span><span><b>{leg['strike']} {leg['type']}</b></span></div>""", unsafe_allow_html=True)
-                                if leg['action'] == 'SELL': short_exp = leg['exp']; short_strike = float(leg['strike'])
-                                elif leg['action'] == 'BUY': long_exp = leg['exp']; long_strike = float(leg['strike'])
+                                cls = "leg-buy" if leg["action"] == "BUY" else "leg-sell"
+                                icon = "🟢" if leg["action"] == "BUY" else "🔴"
+                                st.markdown(
+                                    f"""<div class="blueprint-box {cls}"><span>{icon} <b>{leg['action']} {leg['ratio']}x</b></span><span>{leg['exp']}</span><span><b>{leg['strike']} {leg['type']}</b></span></div>""",
+                                    unsafe_allow_html=True
+                                )
+                                if leg["action"] == "SELL":
+                                    short_exp = leg["exp"]
+                                    short_strike = float(leg["strike"])
+                                elif leg["action"] == "BUY":
+                                    long_exp = leg["exp"]
+                                    long_strike = float(leg["strike"])
                         else:
                             target_strategy = "STRADDLE"
                             for leg in legs:
-                                cls = "leg-buy" if leg['action'] == "BUY" else "leg-sell"
-                                st.markdown(f"""<div class="blueprint-box {cls}"><span>{leg['action']} {leg['ratio']}x</span><span>{leg['exp']}</span><span><b>{leg['strike']} {leg['type']}</b></span></div>""", unsafe_allow_html=True)
-                            if legs: short_exp = legs[0]['exp']; short_strike = float(legs[0]['strike'])
-                except Exception as e: st.error(f"Blueprint Error: {e}")
+                                cls = "leg-buy" if leg["action"] == "BUY" else "leg-sell"
+                                st.markdown(
+                                    f"""<div class="blueprint-box {cls}"><span>{leg['action']} {leg['ratio']}x</span><span>{leg['exp']}</span><span><b>{leg['strike']} {leg['type']}</b></span></div>""",
+                                    unsafe_allow_html=True
+                                )
+                            if legs:
+                                short_exp = legs[0]["exp"]
+                                short_strike = float(legs[0]["strike"])
+                except Exception as e:
+                    st.error(f"Blueprint Error: {e}")
 
             st.divider()
-            urgency = st.radio("Pricing Mode", ["PASSIVE", "NEUTRAL", "AGGRESSIVE"], horizontal=True, label_visibility="collapsed")
-            
+            urgency = st.radio(
+                "Pricing Mode",
+                ["PASSIVE", "NEUTRAL", "AGGRESSIVE"],
+                horizontal=True,
+                label_visibility="collapsed"
+            )
+
             limit_price_display, est_cost_display, is_ready = "---", "---", False
-            
+
             if bp_valid and short_exp:
                 try:
                     sniper = get_sniper()
                     if sniper:
-                        res = sniper.lock_target(symbol=symbol, strategy=target_strategy, short_exp=short_exp, short_strike=short_strike, long_exp=long_exp, long_strike=long_strike, urgency=urgency)
-                        if res['status'] == 'READY':
+                        res = sniper.lock_target(
+                            symbol=symbol,
+                            strategy=target_strategy,
+                            short_exp=short_exp,
+                            short_strike=short_strike,
+                            long_exp=long_exp,
+                            long_strike=long_strike,
+                            urgency=urgency
+                        )
+                        if res.get("status") == "READY":
                             is_ready = True
                             limit_price_display = f"${res['limit_price']:.2f}"
                             est_cost_display = f"${res['est_cost']:.0f}"
-                        else: st.error(res.get('msg'))
-                except Exception as e: st.error(f"Pricing Error: {e}")
+                        else:
+                            st.error(res.get("msg", "Sniper returned FAIL"))
+                    else:
+                        st.error("Sniper not initialized. Check config/config.yaml path & load_config.")
+                except Exception as e:
+                    st.error(f"Pricing Error: {e}")
 
-            st.markdown(f"""<div class="calc-box"><div class="calc-title">CALCULATED LIMIT ({urgency})</div><div class="calc-price">{limit_price_display}</div><div class="calc-sub">Est. Cost: {est_cost_display}</div></div>""", unsafe_allow_html=True)
-            
+            st.markdown(
+                f"""<div class="calc-box"><div class="calc-title">CALCULATED LIMIT ({urgency})</div><div class="calc-price">{limit_price_display}</div><div class="calc-sub">Est. Cost: {est_cost_display}</div></div>""",
+                unsafe_allow_html=True
+            )
+
             c1, c2 = st.columns([4, 1])
             with c1:
-                if st.button("🚀 SEND ORDER TO BROKER", type="primary", use_container_width=True, disabled=not is_ready):
+                if st.button(
+                    "🚀 SEND ORDER TO BROKER",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not is_ready
+                ):
                     st.toast(f"Order Sent! {symbol} @ {limit_price_display}", icon="✅")
             with c2:
-                if st.button("🔄"): st.rerun()
+                if st.button("🔄"):
+                    st.rerun()
 
     else:
         with st.sidebar:
-             st.info("👈 Select a target from the radar.")
+            st.info("👈 Select a target from the radar.")
 
 else:
     st.warning("⚠️ No scan data found. Please run `python src/trade_guardian.py scanlist` first.")
 
-# [FIX] 真正的智能倒计时逻辑
+# 倒计时逻辑
 if auto_ref:
-    # 1. 计算距离上次刷新过去了多久
     time_elapsed = time.time() - st.session_state.last_refresh_time
-    
-    # 2. 计算剩余时间
     time_remaining = 300 - int(time_elapsed)
-    
+
     if time_remaining <= 0:
-        # 时间到：执行刷新
         load_radar_with_deltas.clear()
         st.session_state.last_refresh_time = time.time()
         st.rerun()
     else:
-        # 时间未到：继续倒数，但是从【剩余时间】开始数，而不是300
         countdown_box = st.empty()
-        
-        # 这里的循环每次只跑5秒左右，然后因为用户交互打断，下次重跑时 time_remaining 已经变小了
-        # 这样就实现了“连续”的倒计时，不会重置
         for i in range(time_remaining, 0, -5):
             countdown_box.caption(f"⏳ Auto-refresh in **{i}** seconds...")
             time.sleep(5)
-            
-        # 如果没人打断，倒计时自然结束，强制刷新
         st.rerun()
