@@ -9,29 +9,30 @@ from trade_guardian.strategies.base import Strategy
 
 class IronCondorStrategy(Strategy):
     """
-    Strategy #7: Iron Condor (High Probability / Range Bound)
+    Strategy: Iron Condor (Flexible / Wide Wing Mode)
     
     Logic:
-      - 核心：Delta 布局。利用高 IV 时的期权高溢价，卖出 OTM 宽跨式，并买入更远端保护。
-      - 适用环境：High HV Rank (>50), Structure is FLAT/CONTANGO.
-      - 标准腿 (Standard Setup):
-        - Sell ~20 Delta Call / Sell ~20 Delta Put (Short Strangle)
-        - Buy ~10 Delta Call  / Buy ~10 Delta Put  (Protection Wings)
+      - 默认模式改为 "Wide Wings" (即 Synthetic Strangle)，适配 IRA 账户。
+      - Sell Legs: ~20 Delta (高胜率)
+      - Buy Legs:  ~05 Delta (极远端保护，降低 Theta 损耗)
     """
-    name = "iron_condor"
+    name = "iron_condor" # 保持原有注册名，上游无需修改
 
     def __init__(self, cfg: dict, policy: ShortLegPolicy):
         self.cfg = cfg
         self.policy = policy
+        
+        # [核心修改] 增加配置灵活性
+        # 如果 cfg 里没有指定 wing_delta，默认使用 0.05 (宽翅膀/合成宽跨模式)
+        # 如果想切回标准 IC，只需在 config 传参 wing_delta=0.10
+        self.short_delta = self.cfg.get("short_delta", 0.20)
+        # 默认就是您想要的 0.05 Delta (宽翅膀/退休账户模式)
+        self.wing_delta = self.cfg.get("wing_delta", 0.05) 
 
     def _find_strike_by_delta(self, chain: Dict, exp: str, side: str, target_delta: float) -> Optional[float]:
-        """
-        [核心算法] 在指定到期日寻找 Delta 绝对值最接近 target 的 Strike
-        """
         map_key = "callExpDateMap" if side == "CALL" else "putExpDateMap"
         exp_map = chain.get(map_key, {})
         
-        # 1. 模糊匹配 Expiry Key (e.g. "2025-01-16:29")
         target_key = None
         for k in exp_map.keys():
             if k.startswith(exp):
@@ -39,22 +40,22 @@ class IronCondorStrategy(Strategy):
                 break
         if not target_key: return None
 
-        # 2. 遍历 Strike 寻找最佳 Delta
         best_strike = None
-        min_diff = 999.0
+        # [修改点] 使用 float('inf') 代表正无穷大，这是最标准的写法
+        min_diff = float('inf') 
         
         strikes_data = exp_map[target_key]
         for s_str, quotes in strikes_data.items():
             try:
                 strike = float(s_str)
                 quote = quotes[0]
-                # 注意：Put Delta 是负数，取绝对值比较
                 d = abs(float(quote.get("delta", 0.0))) 
                 
-                # 过滤无效数据 (Delta 太小可能是深虚值垃圾数据)
-                if d < 0.01: continue 
+                if d < 0.001: continue 
                 
                 diff = abs(d - target_delta)
+                
+                # 任何实数 diff 都会小于 float('inf')，逻辑完美
                 if diff < min_diff:
                     min_diff = diff
                     best_strike = strike
@@ -63,18 +64,14 @@ class IronCondorStrategy(Strategy):
         return best_strike
 
     def _get_quote_data(self, chain: Dict, exp: str, side: str, strike: float) -> Tuple[float, float]:
-        """返回 (Price, Delta)"""
         map_key = "callExpDateMap" if side == "CALL" else "putExpDateMap"
         for k, v in chain.get(map_key, {}).items():
-            # 尝试精确匹配 Strike
             if k.startswith(exp):
-                strike_key = f"{strike:.1f}" # Schwab key format often 1 decimal
-                # 模糊查找 key
+                strike_key = f"{strike:.1f}"
                 found_quotes = None
                 if strike_key in v:
                     found_quotes = v[strike_key]
                 else:
-                    # float loop lookup
                     for s_key, q_list in v.items():
                         if abs(float(s_key) - strike) < 0.01:
                             found_quotes = q_list
@@ -82,7 +79,6 @@ class IronCondorStrategy(Strategy):
                 
                 if found_quotes:
                     q = found_quotes[0]
-                    # 价格优先用 mark，没有则中间价
                     px = float(q.get("mark") or (float(q.get("bid",0)) + float(q.get("ask",0)))/2.0)
                     delta = float(q.get("delta", 0.0))
                     return px, delta
@@ -91,32 +87,27 @@ class IronCondorStrategy(Strategy):
     def evaluate(self, ctx: Context) -> ScanRow:
         hv_rank = float(ctx.hv.hv_rank)
         
-        # 1. 锁定时间：使用 Month Anchor (通常 30-45 DTE)
         exp = ctx.tsf.get("month_exp")
         dte = int(ctx.tsf.get("month_dte", 0))
         
         if not exp or dte < 20:
             return self._empty_row(ctx, score=0, risk=99, note="DTE < 20")
 
-        # 2. 寻找四条腿 (Delta 寻址)
-        # Put Side (Otm)
-        s_put_k = self._find_strike_by_delta(ctx.raw_chain, exp, "PUT", 0.20)
-        l_put_k = self._find_strike_by_delta(ctx.raw_chain, exp, "PUT", 0.10)
+        # [使用配置参数]
+        s_put_k = self._find_strike_by_delta(ctx.raw_chain, exp, "PUT", self.short_delta)
+        l_put_k = self._find_strike_by_delta(ctx.raw_chain, exp, "PUT", self.wing_delta)
         
-        # Call Side (Otm)
-        s_call_k = self._find_strike_by_delta(ctx.raw_chain, exp, "CALL", 0.20)
-        l_call_k = self._find_strike_by_delta(ctx.raw_chain, exp, "CALL", 0.10)
+        s_call_k = self._find_strike_by_delta(ctx.raw_chain, exp, "CALL", self.short_delta)
+        l_call_k = self._find_strike_by_delta(ctx.raw_chain, exp, "CALL", self.wing_delta)
 
-        # [DEBUG关键点] 完整性检查：如果任意一条腿没找到 (通常是因为周末 Delta=0)，返回带错误信息的 Row
         if not all([s_put_k, l_put_k, s_call_k, l_call_k]):
-             return self._empty_row(ctx, score=0, risk=99, note="Legs Missing (Delta=0?)")
+             return self._empty_row(ctx, score=0, risk=99, note="Legs Missing")
         
-        # 逻辑检查：Put Long < Short < Price < Call Short < Call Long
         price = ctx.price
+        # 简单的逻辑检查
         if not (l_put_k < s_put_k < price < s_call_k < l_call_k):
              return self._empty_row(ctx, score=0, risk=99, note="Inv Strikes")
 
-        # 3. 估算价格与风险
         p_sp, d_sp = self._get_quote_data(ctx.raw_chain, exp, "PUT", s_put_k)
         p_lp, d_lp = self._get_quote_data(ctx.raw_chain, exp, "PUT", l_put_k)
         p_sc, d_sc = self._get_quote_data(ctx.raw_chain, exp, "CALL", s_call_k)
@@ -128,27 +119,37 @@ class IronCondorStrategy(Strategy):
         max_width = max(width_put, width_call)
         
         max_risk = max_width - credit
-        if max_risk <= 0: max_risk = 0.1 # 防止除零
+        if max_risk <= 0: max_risk = 0.1
         
         ror = credit / max_risk
 
-        # 4. 评分逻辑 (Scoring)
+        # [自动适应评分]
+        # 如果是宽翅膀 (Delta <= 0.05)，RoR 阈值自动降低
+        # 如果是标准 IC (Delta >= 0.10)，RoR 阈值保持较高
         score = 50
         
         if hv_rank > 50: score += 10
         if hv_rank > 80: score += 10
         if hv_rank < 30: score -= 20
         
-        if ror > 0.30: score += 15
-        elif ror > 0.20: score += 5
-        elif ror < 0.15: score -= 10
+        if self.wing_delta <= 0.06:
+            # === 宽翅膀评分标准 (IRA Mode) ===
+            if ror > 0.18: score += 15
+            elif ror > 0.12: score += 5
+            elif ror < 0.10: score -= 15
+        else:
+            # === 标准 IC 评分标准 (Standard Mode) ===
+            if ror > 0.30: score += 15
+            elif ror > 0.20: score += 5
+            elif ror < 0.15: score -= 10
         
         if ctx.tsf.get("regime") == "BACKWARDATION":
             score -= 30 
             
-        # 5. 构建 Blueprint
-        tag = "IC"
-        if ror > 0.35: tag = "IC-RICH"
+        # 根据模式打不同的 Tag，方便前台区分
+        tag = "IC-WIDE" if self.wing_delta <= 0.06 else "IC-STD"
+        if ror > (0.20 if self.wing_delta <= 0.06 else 0.35):
+            tag += "-RICH"
         
         legs = [
             OrderLeg(ctx.symbol, "SELL", 1, exp, s_put_k, "PUT"),
@@ -159,16 +160,14 @@ class IronCondorStrategy(Strategy):
         
         bp = Blueprint(
             symbol=ctx.symbol,
-            strategy="IRON_CONDOR",
+            strategy="IRON_CONDOR", # 保持原有策略名，兼容数据库
             legs=legs,
-            est_debit= -round(credit, 2), # 负数 Debit = Credit
-            note=f"Credit ${credit:.2f} | Risk ${max_risk:.2f} | RoR {ror:.1%}",
+            est_debit= -round(credit, 2),
+            note=f"Wing D.{self.wing_delta:.2f} | Risk ${max_risk:.2f} | RoR {ror:.1%}",
             error=None
         )
-        
         bp.short_greeks = {"delta": d_sc}
 
-        # Risk 分数简单映射
         calc_risk = max(0, 100 - score)
 
         row = ScanRow(
@@ -190,18 +189,14 @@ class IronCondorStrategy(Strategy):
             meta={
                 "credit": credit, 
                 "width": max_width,
-                "est_gamma": 0.0
+                "wing_delta": self.wing_delta
             }
         )
         row.blueprint = bp
         return row
 
     def _empty_row(self, ctx, score, risk, note):
-        """
-        返回一个表示失败的 ScanRow，而不是 None。
-        这样 Orchestrator 就不会静默跳过它，前台能看到 "IC-FAIL"。
-        """
-        # 构造一个带 Error 的 Blueprint
+        # 保持原有结构
         bp = Blueprint(
             symbol=ctx.symbol,
             strategy="IC-FAIL",
@@ -210,25 +205,14 @@ class IronCondorStrategy(Strategy):
             error=note,
             note=note
         )
-
         return ScanRow(
             symbol=ctx.symbol,
             price=ctx.price,
-            short_exp="N/A", 
-            short_dte=0, 
-            short_iv=0.0, 
-            base_iv=0.0, 
-            edge=0.0, 
-            hv_rank=float(ctx.hv.hv_rank),
-            regime="N/A", 
-            curvature="N/A", 
-            tag="IC-FAIL",
-            cal_score=score, 
-            short_risk=risk,
-            score_breakdown=ScoreBreakdown(), 
-            risk_breakdown=RiskBreakdown(),
-            meta={"error": note},
-            blueprint=bp
+            short_exp="N/A", short_dte=0, short_iv=0.0, base_iv=0.0, edge=0.0, 
+            hv_rank=float(ctx.hv.hv_rank), regime="N/A", curvature="N/A", 
+            tag="IC-FAIL", cal_score=score, short_risk=risk,
+            score_breakdown=ScoreBreakdown(), risk_breakdown=RiskBreakdown(),
+            meta={"error": note}, blueprint=bp
         )
 
     def recommend(self, ctx: Context, min_score: int, max_risk: int) -> Tuple[Optional[Recommendation], str]:
@@ -245,4 +229,4 @@ class IronCondorStrategy(Strategy):
                 meta=row.meta
              )
              return rec, "OK"
-        return None, "Score too low or build fail"
+        return None, "Score too low"
