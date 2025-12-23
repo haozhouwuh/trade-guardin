@@ -28,10 +28,17 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# [FIX] 初始化 Session State 中的刷新时间锚点
+if 'last_refresh_time' not in st.session_state:
+    st.session_state.last_refresh_time = time.time()
+
 st.markdown("""
 <style>
-    /* 侧边栏宽度强行锁定 450px */
-    [data-testid="stSidebar"] { min-width: 450px !important; max-width: 450px !important; }
+    /* 去除顶部大片空白 */
+    .block-container {
+        padding-top: 1rem !important;
+        padding-bottom: 1rem !important;
+    }
     
     /* 进度条颜色 */
     .stProgress > div > div > div > div { background-color: #f63366; }
@@ -94,7 +101,6 @@ def get_past_batch_id(conn, current_ts_str, minutes_ago):
         return None
     except: return None
 
-# [核心] 加上缓存，防止点击表格时数据重载导致选中丢失
 @st.cache_data(ttl=10)
 def load_radar_with_deltas():
     db_path = os.path.join(project_root, "db", "trade_guardian.db")
@@ -169,61 +175,53 @@ if df is not None:
     col2.metric("Scan Time", ts.split(" ")[1]) 
     col3.metric("Candidates", len(df))
     
+    # [FIX] 手动刷新时，必须更新时间锚点
     if col4.button("🔄 Refresh"): 
         load_radar_with_deltas.clear()
+        st.session_state.last_refresh_time = time.time() # 重置计时器
         st.rerun()
     
     auto_ref = col5.checkbox("Auto (5min)", value=st.session_state.auto_refresh)
     st.session_state.auto_refresh = auto_ref
     
-    # --- 主表格 (Radar) ---
+    # --- 主表格 ---
     display_df = df.copy()
     
-    # 显式重命名列，找回希腊字母 Δ
-    display_df = display_df.rename(columns={
-        "d_10m": "Δ10m",
-        "d_1h": "Δ1h"
-    })
-    
-    # Emoji 上色
-    def color_delta(val):
-        color = '#00c853' if val > 0 else '#f44336' if val < 0 else '#888'
-        return f'color: {color}'
+    def format_delta(val):
+        if val > 0: return f"🟢 +{val:.2f}"
+        elif val < 0: return f"🔴 {val:.2f}"
+        else: return f"⚪ {val:.2f}"
 
-    # [MODIFIED] 调整列顺序：将 'cal_score' 移到最后 (blueprint_json之前)
+    display_df['Δ10m'] = display_df['d_10m'].apply(format_delta)
+    display_df['Δ1h'] = display_df['d_1h'].apply(format_delta)
+    
     cols = ['symbol', 'price', 'Δ10m', 'Δ1h', 'iv_short', 'edge', 'regime', 'strategy_type', 'tag', 'gate_status', 'cal_score', 'blueprint_json']
     cols = [c for c in cols if c in display_df.columns]
     display_df = display_df[cols]
     
-    # 应用样式
-    styled_df = display_df.style.format({
-        "price": "${:.2f}",
-        "Δ10m": "{:+.2f}",
-        "Δ1h": "{:+.2f}",
-        "edge": "{:.2f}",
-        "iv_short": "{:.1f}%",
-    }).map(color_delta, subset=['Δ10m', 'Δ1h'])
-
     column_cfg = {
         "blueprint_json": None, 
         "cal_score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
         "symbol": st.column_config.TextColumn("Symbol", width="small"),
+        "price": st.column_config.NumberColumn("Price", format="$%.2f"),
+        "edge": st.column_config.NumberColumn("Edge", format="%.2f"),
+        "iv_short": st.column_config.NumberColumn("IV", format="%.1f%%"),
     }
 
     event = st.dataframe(
-        styled_df, 
+        display_df, 
         width="stretch", 
         hide_index=True, 
         column_config=column_cfg, 
         selection_mode="single-row", 
         on_select="rerun", 
-        height=550
+        height=700,
+        key="radar_master" 
     )
     
     # --- 侧边栏 ---
     if len(event.selection.rows) > 0:
         selected_index = event.selection.rows[0]
-        # 注意：这里要用原始的 df 来获取数据，因为 display_df 列名变了
         row = df.iloc[selected_index]
         symbol = row['symbol']
         bp_json_raw = row['blueprint_json']
@@ -232,7 +230,9 @@ if df is not None:
             st.markdown(f"## 🔭 Scope: **{symbol}**")
             
             gate_color = "#00c853" if row['gate_status'] == "EXEC" else ("#ffeb3b" if row['gate_status'] == "LIMIT" else "#f44336")
-            strat_display = row['strategy_type'].replace("STRADDLE", "STRD").replace("DIAGONAL", "DIAG")
+            
+            # 使用全名
+            strat_display = row['strategy_type']
             
             st.markdown(f"""
             <div class="sidebar-header">
@@ -295,13 +295,35 @@ if df is not None:
             with c2:
                 if st.button("🔄"): st.rerun()
 
+    else:
+        with st.sidebar:
+             st.info("👈 Select a target from the radar.")
+
 else:
     st.warning("⚠️ No scan data found. Please run `python src/trade_guardian.py scanlist` first.")
 
-# 倒计时循环
+# [FIX] 真正的智能倒计时逻辑
 if auto_ref:
-    countdown_box = st.empty()
-    for i in range(300, 0, -5):
-        countdown_box.caption(f"⏳ Auto-refresh in **{i}** seconds...")
-        time.sleep(5)
-    st.rerun()
+    # 1. 计算距离上次刷新过去了多久
+    time_elapsed = time.time() - st.session_state.last_refresh_time
+    
+    # 2. 计算剩余时间
+    time_remaining = 300 - int(time_elapsed)
+    
+    if time_remaining <= 0:
+        # 时间到：执行刷新
+        load_radar_with_deltas.clear()
+        st.session_state.last_refresh_time = time.time()
+        st.rerun()
+    else:
+        # 时间未到：继续倒数，但是从【剩余时间】开始数，而不是300
+        countdown_box = st.empty()
+        
+        # 这里的循环每次只跑5秒左右，然后因为用户交互打断，下次重跑时 time_remaining 已经变小了
+        # 这样就实现了“连续”的倒计时，不会重置
+        for i in range(time_remaining, 0, -5):
+            countdown_box.caption(f"⏳ Auto-refresh in **{i}** seconds...")
+            time.sleep(5)
+            
+        # 如果没人打断，倒计时自然结束，强制刷新
+        st.rerun()
