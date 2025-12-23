@@ -1,0 +1,1 @@
+streamlit run src/trade_guardian/ui/dashboard.py

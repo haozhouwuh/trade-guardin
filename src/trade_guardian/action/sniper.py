@@ -23,7 +23,7 @@ class Sniper:
                     short_strike: float,
                     long_exp: Optional[str] = None, 
                     long_strike: Optional[float] = None,
-                    urgency: str = "PASSIVE"  # <--- [NEW] 新增参数: PASSIVE, NEUTRAL, AGGRESSIVE
+                    urgency: str = "PASSIVE"
                     ) -> Dict[str, Any]:
         """
         全能锁定逻辑：支持 Straddle 和 Diagonal
@@ -39,11 +39,12 @@ class Sniper:
         # --- 策略分支 ---
         
         # A) 跨式策略 (STRADDLE / LG)
-        if strategy in ["STRADDLE", "LG", "LONG_GAMMA"]:
-            # Recenter 逻辑... (简化版，只看 ATM)
-            # Fetch chain for valid strikes
-            chain_data = self.client._fetch_calls_chain(symbol, short_exp, short_exp)
+        if strategy in ["STRADDLE", "LG", "LONG_GAMMA", "AUTO-LG"]:
+            # [FIX] 强制 range_val="ALL" 以确保获取所有 Strike
+            chain_data = self.client._fetch_calls_chain(symbol, short_exp, short_exp, range_val="ALL")
             call_map = chain_data.get("callExpDateMap", {})
+            
+            # Recenter 逻辑 (只看 ATM)
             valid_strikes = []
             for k, v in call_map.items():
                 if k.startswith(short_exp):
@@ -57,7 +58,7 @@ class Sniper:
             q_call = self._extract_quote(chain_data, "callExpDateMap", short_exp, final_strike)
             q_put = self._extract_quote(chain_data, "putExpDateMap", short_exp, final_strike)
             
-            if not q_call or not q_put: return {"status": "FAIL", "msg": "Missing Quotes"}
+            if not q_call or not q_put: return {"status": "FAIL", "msg": "Missing Quotes (Straddle)"}
             
             # 合成报价 (Debit = Call + Put)
             bid = q_call['bid'] + q_put['bid']
@@ -69,23 +70,23 @@ class Sniper:
             if not long_exp or not long_strike:
                 return {"status": "FAIL", "msg": "Diagonal requires long_exp and long_strike"}
             
-            # Diagonal 不需要 Recenter Strike，因为它是基于特定 Delta 选的，而不是纯 ATM
-            # 我们直接信任传入的参数，或者在此处加入复杂的 Delta 校验逻辑 (暂略)
-            
-            # 获取两头的报价
-            # 为了省流量，这里假设我们需要 fetch 两次 chain 或者一次大的
-            # 简单起见，我们 fetch 包含这两个日期的 chain
-            # 注意：实际生产中 Schwab API fetch ALL range 比较大，这里为了演示逻辑简化处理
-            chain_short = self.client._fetch_calls_chain(symbol, short_exp, short_exp)
-            chain_long = self.client._fetch_calls_chain(symbol, long_exp, long_exp)
+            # [FIX] 关键修复：range_val="ALL"
+            # QQQ 等高价股的 Long Leg 通常是深度实值，如果不加 ALL 会被 API 过滤掉
+            chain_short = self.client._fetch_calls_chain(symbol, short_exp, short_exp, range_val="ALL")
+            chain_long = self.client._fetch_calls_chain(symbol, long_exp, long_exp, range_val="ALL")
             
             # Call Diagonal: Long Call (Far) - Short Call (Near)
             q_short = self._extract_quote(chain_short, "callExpDateMap", short_exp, short_strike)
             q_long = self._extract_quote(chain_long, "callExpDateMap", long_exp, long_strike)
             
-            if not q_short or not q_long: return {"status": "FAIL", "msg": "Missing Diagonal Quotes"}
+            if not q_short or not q_long: 
+                # 诊断信息：帮助确认是哪一条腿缺了
+                missing = []
+                if not q_short: missing.append(f"Short({short_exp} {short_strike})")
+                if not q_long: missing.append(f"Long({long_exp} {long_strike})")
+                return {"status": "FAIL", "msg": f"Missing Diagonal Quotes: {', '.join(missing)}"}
             
-            # 合成报价 (Debit = Long Ask - Short Bid) -> 这是最保守的买入价
+            # 合成报价 (Debit = Long Ask - Short Bid)
             # 实际上 Mid Calculation:
             mid_short = (q_short['bid'] + q_short['ask']) / 2.0
             mid_long = (q_long['bid'] + q_long['ask']) / 2.0
@@ -93,9 +94,9 @@ class Sniper:
             # Debit = Long - Short
             mid_price = mid_long - mid_short
             
-            # Spread 计算有点复杂，简单估算：
-            bid = q_long['bid'] - q_short['ask'] # 最悲观卖出价
-            ask = q_long['ask'] - q_short['bid'] # 最悲观买入价
+            # Spread 计算：悲观 Bid (卖出价) / 悲观 Ask (买入价)
+            bid = q_long['bid'] - q_short['ask'] 
+            ask = q_long['ask'] - q_short['bid'] 
             
             legs_desc = f"+{long_exp} {long_strike}C / -{short_exp} {short_strike}C"
             
@@ -114,25 +115,20 @@ class Sniper:
             
         print(f"   • Liquidity: OK (Spread: {comp_spread:.2f})")
 
-        # [MODIFIED] 动态定价策略
+        # 动态定价策略
         tick = self._get_tick_size(comp_mid)
         
         if urgency == "AGGRESSIVE":
-            # 激进模式：直接打 Ask 价 (或者 Mid + 溢价)，确保成交
-            # 这里的 Ask 是我们要付出的最大代价 (因为是 Debit 策略)
-            # 为了防止被做市商宰太狠，我们可以定在 Ask
             target_price = ask 
             desc = "AGGRESSIVE (Hit Ask)"
             color = Fore.RED
             
         elif urgency == "NEUTRAL":
-            # 中性模式：不占便宜，也不吃亏，挂中间
             target_price = comp_mid
             desc = "NEUTRAL (Fair Value)"
             color = Fore.YELLOW
             
         else: # PASSIVE (默认)
-            # 钓鱼模式：想省点钱
             improvement = max(tick, 0.03)
             target_price = comp_mid - improvement
             desc = "PASSIVE (Fishing)"
@@ -152,15 +148,33 @@ class Sniper:
         }
 
     def _extract_quote(self, chain, map_key, exp, strike):
-        """Helper to dig out quote from raw chain dict"""
+        """
+        Helper to dig out quote from raw chain dict.
+        Contains Robust Matching logic for strikes (Float vs String mismatch).
+        """
         exp_map = chain.get(map_key, {})
-        for k, v in exp_map.items():
+        
+        # 1. 找到对应的 Expiry Date Key (例如 "2025-12-26:4")
+        target_exp_key = None
+        for k in exp_map.keys():
             if k.startswith(exp):
-                s_key = str(strike) # Schwab keys are weird sometimes
-                # try exact string match
-                if s_key in v: return v[s_key][0]
-                # try float match
-                for sk, qlist in v.items():
-                    if abs(float(sk) - strike) < 0.01:
-                        return qlist[0]
+                target_exp_key = k
+                break
+        
+        if not target_exp_key:
+            return None
+            
+        strikes_map = exp_map[target_exp_key]
+        target_strike = float(strike)
+        
+        # 2. 遍历所有 Strike 寻找匹配 (容错 0.01)
+        # 解决 API 返回 "619.0" 而目标是 619 的 key 不匹配问题
+        for s_str, q_list in strikes_map.items():
+            try:
+                s_val = float(s_str)
+                if abs(s_val - target_strike) < 0.01:
+                    return q_list[0]
+            except ValueError:
+                continue
+                
         return None
