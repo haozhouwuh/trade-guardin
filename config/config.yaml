@@ -13,28 +13,62 @@ scan:
 rules:
   # 结构优势门槛
   min_edge_short_base: 1.05
-  
+
   # [Long Gamma] 硬性风控参数
   lg_min_dte_etf: 7
   lg_min_dte_stock: 10
-  lg_max_spread_pct: 0.08  # Spread/Mid > 8% 禁止开仓
-  
-  # [Risk Caps] 风险上限
-  gamma_soft_cap: 0.24     # 超过此值降级为 LIMIT
-  gamma_hard_cap: 0.32     # 超过此值直接 FORBID
-  
-  # [Pin Risk] 磁吸/钉仓风险
+  lg_max_spread_pct: 0.08
+
+  # [Risk Caps]
+  gamma_soft_cap: 0.24
+  gamma_hard_cap: 0.32
+
+  # [Pin Risk]
   pin_risk_cap: 0.25
   pin_risk_coeff: 0.3
 
-  # [Time Stop] 时间止损参数
+  # [Time Stop]
   lg_time_stop_min: 90
   lg_no_move_frac: 0.25
 
-  # [Momentum] 动能门槛
-  lg_allowed_dna_exec: ["PULSE"]         
-  lg_allowed_dna_limit: ["TREND"]        
-  lg_dna_quiet_action: "WAIT"            
+  # [Momentum]
+  lg_allowed_dna_exec: ["PULSE"]
+  lg_allowed_dna_limit: ["TREND"]
+  lg_dna_quiet_action: "WAIT"
+
+  # ==========================================
+  # [Anchor] 用于结构评估（Edge/Shape）的“锚点”
+  # ==========================================
+  anchor_min_dte: 20
+  anchor_max_dte: 45
+  anchor_fallback_max_dte: 90
+  anchor_target_dte: 35
+  anchor_lambda_dist: 0.35
+  anchor_prefer_monthly: true   # 主窗口内优先第三周五（避免 59DTE 在 fallback 吸走一切）
+
+  # ------------------------------------------
+  # [Compatibility] 兼容旧字段：month_* = anchor_*
+  # （如果你已把代码改成读 anchor_*，这段可以删）
+  # ------------------------------------------
+  month_min_dte: 20
+  month_max_dte: 45
+  month_fallback_max_dte: 90
+  month_target_dte: 35
+  month_lambda_dist: 0.35
+  month_prefer_monthly: true
+
+  # ==========================================
+  # [Diagonal Long] 用于“对角线长腿”的真实 long exp（交易用）
+  # ==========================================
+  diag_long_min_dte: 45
+  diag_long_max_dte: 75
+  diag_long_fallback_max_dte: 120
+  diag_long_target_dte: 60
+  diag_long_lambda_dist: 0.25
+  diag_long_prefer_monthly: true
+  diag_long_min_gap_vs_short: 20   # long_dte 至少比 short_dte 多 20 天
+
+
 
 policy:
   base_rank: 1

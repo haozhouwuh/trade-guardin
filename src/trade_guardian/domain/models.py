@@ -127,6 +127,10 @@ class Blueprint:
     note: str = ""
     gamma_exposure: float = 0.0
     error: Optional[str] = None
+
+    # [NEW] 允许存放 spread_pct / pin_risk / extra diagnostics 等
+    meta: Dict[str, Any] = field(default_factory=dict)
+
     # 允许动态挂载 greeks 字典
     short_greeks: Dict[str, float] = field(default_factory=dict)
     long_greeks: Dict[str, float] = field(default_factory=dict)
