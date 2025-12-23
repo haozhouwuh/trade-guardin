@@ -22,12 +22,14 @@ def main():
 
     # ---------- initconfig ----------
     p_init = sub.add_parser("initconfig", help="Generate config/config.json template")
-    p_init.add_argument("--path", type=str, default=None, help="Output path (default: ./config/config.json)")
+    #p_init.add_argument("--path", type=str, default=None, help="Output path (default: ./config/config.json)")
+    p_init.add_argument("--path", type=str, default=None, help="Output path (default: ./config/config.yaml)")
     p_init.add_argument("--force", action="store_true", help="Overwrite if exists")
 
     # ---------- scanlist ----------
     p_scan = sub.add_parser("scanlist", help="Scan tickers.csv and output candidates")
-    p_scan.add_argument("--config", type=str, default=None, help="Config path (default: ./config/config.json)")
+    #p_scan.add_argument("--config", type=str, default=None, help="Config path (default: ./config/config.json)")
+    p_scan.add_argument("--config", type=str, default=None, help="Config path (default: ./config/config.yaml)")
     p_scan.add_argument("--autogen-config", action="store_true", help="Auto-generate config if missing")
     p_scan.add_argument("--no-autogen-config", action="store_true", help="Disable auto-generate config")
 
@@ -70,7 +72,8 @@ def main():
     # 1. initconfig
     # ==========================================
     if args.cmd == "initconfig":
-        out = args.path or os.path.join(root, "config", "config.json")
+        #out = args.path or os.path.join(root, "config", "config.json")
+        out = args.path or os.path.join(root, "config", "config.yaml")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         write_config_template(out, DEFAULT_CONFIG, overwrite=args.force)
         print(f"✅ Wrote config template: {out}")
@@ -83,7 +86,8 @@ def main():
         # 记录开始时间，用于数据库存盘
         start_ts = time.time()
 
-        cfg_path = args.config or os.path.join(root, "config", "config.json")
+        #cfg_path = args.config or os.path.join(root, "config", "config.json")
+        cfg_path = args.config or os.path.join(root, "config", "config.yaml")
 
         # 检查是否需要自动生成配置
         autogen_default = bool(DEFAULT_CONFIG.get("runtime", {}).get("autogen_config_if_missing", True))

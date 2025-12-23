@@ -1,0 +1,58 @@
+# ==========================================
+# 🛡️ Trade Guardian Config (V4.4 Final Closed Loop)
+# ==========================================
+
+paths:
+  tickers_csv: "data/tickers.csv"
+  cache_dir: "cache"
+
+scan:
+  throttle_sec: 0.5
+  contract_type: "ALL"
+
+rules:
+  # 结构优势门槛
+  min_edge_short_base: 1.05
+  
+  # [Long Gamma] 硬性风控参数
+  lg_min_dte_etf: 7
+  lg_min_dte_stock: 10
+  lg_max_spread_pct: 0.08  # Spread/Mid > 8% 禁止开仓
+  
+  # [Risk Caps] 风险上限
+  gamma_soft_cap: 0.24     # 超过此值降级为 LIMIT
+  gamma_hard_cap: 0.32     # 超过此值直接 FORBID
+  
+  # [Pin Risk] 磁吸/钉仓风险
+  pin_risk_cap: 0.25
+  pin_risk_coeff: 0.3
+
+  # [Time Stop] 时间止损参数
+  lg_time_stop_min: 90
+  lg_no_move_frac: 0.25
+
+  # [Momentum] 动能门槛
+  lg_allowed_dna_exec: ["PULSE"]         
+  lg_allowed_dna_limit: ["TREND"]        
+  lg_dna_quiet_action: "WAIT"            
+
+policy:
+  base_rank: 1
+  min_dte: 1
+  probe_count: 3
+
+strategies:
+  diagonal:
+    use_rank_0_for_short: true
+    short_min_dte: 1
+    short_max_dte: 14
+  
+  hv_calendar:
+    hv_rules:
+      hv_low_rank: 20.0
+      hv_mid_rank: 50.0
+      hv_high_rank: 70.0
+      hv_low_bonus: 10
+      hv_mid_bonus: 4
+      hv_high_penalty: -4
+      hv_extreme_penalty: -10
