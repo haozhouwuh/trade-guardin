@@ -460,15 +460,29 @@ with tab_manager:
         sniper_instance = get_sniper()
         enhanced_trades = calculate_live_pnl(trades, sniper_instance)
         
-        # Top Stats Row
-        c1, c2, c3, c4 = st.columns([1, 1, 2, 2])
+        # [MODIFIED] Top Stats Row (Compact & Right-aligned PnL)
         open_c = sum(1 for t in enhanced_trades if t['status']=='OPEN')
         work_c = sum(1 for t in enhanced_trades if t['status']=='WORKING')
         tot_pnl = sum(t.get('live_pnl', 0.0) or 0.0 for t in enhanced_trades)
         
-        c1.metric("Open", open_c)
-        c2.metric("Working", work_c)
-        c3.metric("Unrealized PnL", f"${tot_pnl:.2f}", delta=f"{tot_pnl:.2f}", delta_color="normal" if tot_pnl>=0 else "inverse")
+        c1, c2, c3, c4 = st.columns([0.8, 0.8, 2, 2])
+        
+        with c1:
+            st.markdown(f"<div style='font-size:0.8rem; color:#aaa'>Open</div><div style='font-size:1.1rem; font-weight:bold; color:#fff'>{open_c}</div>", unsafe_allow_html=True)
+            
+        with c2:
+            st.markdown(f"<div style='font-size:0.8rem; color:#aaa'>Working</div><div style='font-size:1.1rem; font-weight:bold; color:#ffeb3b'>{work_c}</div>", unsafe_allow_html=True)
+            
+        with c3:
+            p_color = "#00c853" if tot_pnl >= 0 else "#f44336"
+            p_delta = f"+{tot_pnl:.2f}" if tot_pnl >= 0 else f"{tot_pnl:.2f}"
+            st.markdown(f"""
+                <div style='font-size:0.8rem; color:#aaa'>Unrealized PnL</div>
+                <div style='display:flex; align-items:baseline; gap:8px'>
+                    <span style='font-size:1.1rem; font-weight:bold; color:#fff'>${tot_pnl:.2f}</span>
+                    <span style='font-size:0.85rem; color:{p_color}; background:#1e1e1e; padding:1px 4px; border-radius:3px'>{p_delta}</span>
+                </div>
+            """, unsafe_allow_html=True)
         
         st.markdown("---")
 
