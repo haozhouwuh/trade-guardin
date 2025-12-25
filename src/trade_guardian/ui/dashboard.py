@@ -215,10 +215,6 @@ def load_radar_with_deltas():
         conn.close()
 
 def calculate_live_pnl(trades, sniper_client):
-    """
-    FIXED: Unconditionally fetch live prices for all active trades (WORKING or OPEN).
-    Only calculate PnL if status is OPEN.
-    """
     if not trades or not sniper_client:
         return trades or []
     enhanced_trades = []
@@ -237,7 +233,7 @@ def calculate_live_pnl(trades, sniper_client):
             all_legs_valid = True
             live_legs = []
             
-            # [CRITICAL FIX] Always loop through legs to get prices, regardless of status
+            # 无论什么状态，都先获取实时报价 (Crucial for Fill action)
             for leg in legs:
                 l_copy = dict(leg)
                 exp = l_copy.get('exp_date')
@@ -252,7 +248,7 @@ def calculate_live_pnl(trades, sniper_client):
                     entry_px = float(raw_ep)
                 except: entry_px = 0.0
                 
-                # 2. Fetch Live Price (Crucial for Fill)
+                # 2. Fetch Live Price
                 leg_price = 0.0
                 chain_data = sniper_client._fetch_chain_one_exp(t['symbol'], exp)
                 side_key = "callExpDateMap" if op_type.upper() == "CALL" else "putExpDateMap"
@@ -268,16 +264,15 @@ def calculate_live_pnl(trades, sniper_client):
                 else:
                     all_legs_valid = False
                 
-                # 3. Add to Strategy Value (for PnL calc)
+                # 3. Add to Strategy Value
                 side_mult = 1 if str(action).upper() == 'BUY' else -1
                 current_strategy_value += (leg_price * side_mult)
                 
-                # 4. Calculate PnL (ONLY if OPEN)
+                # 4. Calculate PnL (ONLY if OPEN and entry_px valid)
                 l_copy['leg_pnl'] = None
                 if status_str == 'OPEN':
                     if entry_px > 0.001:
                         # Logic: Current Price - Entry Price (for Display)
-                        # Does not multiply by 100 or Qty for per-unit display
                         if str(action).upper() == 'BUY': 
                             l_pnl = leg_price - entry_px
                         else: 
@@ -361,7 +356,7 @@ if os.path.exists(db_path):
 tab_scanner, tab_manager = st.tabs(["📡 Scanner", "💼 Active Trades"])
 
 # ==========================================
-# TAB 1: Scanner (保持不变，只是 Sidebar 微调)
+# TAB 1: Scanner
 # ==========================================
 with tab_scanner:
     if "auto_refresh" not in st.session_state:
@@ -447,7 +442,8 @@ with tab_scanner:
                     except: st.error("Blueprint Error")
 
                 st.divider()
-                urgency = st.radio("Pricing", ["PASSIVE", "NEUTRAL", "AGGRESSIVE"], horizontal=True, label_visibility="collapsed")
+                # [MODIFIED] Changed horizontal=True to False for vertical layout
+                urgency = st.radio("Pricing", ["PASSIVE", "NEUTRAL", "AGGRESSIVE"], horizontal=False, label_visibility="collapsed")
                 limit_price_display, est_cost_display, is_ready, limit_price_val = "---", "---", False, 0.0
 
                 if bp_valid and short_exp:
@@ -598,6 +594,7 @@ with tab_manager:
                     with c_act2:
                         if st.button("Fill", key=f"b_fill_{t_id}"):
                             db.update_trade_status(t_id, "OPEN", fill_px)
+                            # [IMPORTANT] Update leg entry prices with the live prices captured in t['legs']
                             if 'legs' in t: db.update_leg_entry_prices(t_id, t['legs'])
                             st.rerun()
                     with c_act4:
