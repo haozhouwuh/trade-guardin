@@ -215,65 +215,101 @@ def load_radar_with_deltas():
         conn.close()
 
 def calculate_live_pnl(trades, sniper_client):
+    """
+    FIXED: Unconditionally fetch live prices for all active trades (WORKING or OPEN).
+    Only calculate PnL if status is OPEN.
+    """
     if not trades or not sniper_client:
         return trades or []
     enhanced_trades = []
     CREDIT_KEYWORDS = ["BULL-PUT", "BEAR-CALL", "CREDIT", "IC", "IRON", "CONDOR", "VERTICAL"]
+    
     for t in trades:
         t_enhanced = dict(t)
-        if t['status'] == 'OPEN':
-            try:
-                legs = t.get('legs', [])
-                strat_type = str(t.get('strategy', '')).upper()
-                tags = str(t.get('tags', '')).upper()
-                is_credit = any(k in strat_type or k in tags for k in CREDIT_KEYWORDS)
-                current_strategy_value = 0.0
-                all_legs_valid = True
-                live_legs = []
-                for leg in legs:
-                    l_copy = dict(leg)
-                    exp = l_copy.get('exp_date')
-                    strike = float(l_copy.get('strike'))
-                    op_type = l_copy.get('op_type') 
-                    action = l_copy.get('action')   
-                    entry_px = float(l_copy.get('entry_price', 0.0) or 0.0)
-                    chain_data = sniper_client._fetch_chain_one_exp(t['symbol'], exp)
-                    side_key = "callExpDateMap" if op_type.upper() == "CALL" else "putExpDateMap"
-                    q_data = sniper_client._extract_quote(chain_data, side_key, exp, strike)
-                    leg_price = 0.0
-                    if q_data:
-                        bid = float(q_data.get('bid', 0))
-                        ask = float(q_data.get('ask', 0))
-                        mark = float(q_data.get('mark', 0))
-                        if bid > 0 and ask > 0: mid = (bid + ask) / 2.0
-                        elif mark > 0: mid = mark
-                        else: mid = 0.0
-                        leg_price = mid
-                        side_mult = 1 if action.upper() == 'BUY' else -1
-                        current_strategy_value += (mid * side_mult)
-                        if t['status'] == 'OPEN' and entry_px > 0:
-                            if action.upper() == 'BUY': l_pnl = (leg_price - entry_px) * 100 * int(t.get('quantity', 1))
-                            else: l_pnl = (entry_px - leg_price) * 100 * int(t.get('quantity', 1))
-                            l_copy['leg_pnl'] = l_pnl
-                        else: l_copy['leg_pnl'] = None
-                    else: all_legs_valid = False
-                    l_copy['live_price'] = leg_price
-                    live_legs.append(l_copy)
-                t_enhanced['legs'] = live_legs
-                if t['status'] == 'OPEN' and all_legs_valid:
-                    fill_price = float(t['initial_cost'] or 0.0)
-                    qty = int(t['quantity'] or 1)
-                    if is_credit:
-                        pnl_total = (fill_price + current_strategy_value) * 100 * qty
-                        pnl_pct = (pnl_total / (abs(fill_price) * 100 * qty)) * 100 if abs(fill_price)>0.01 else 0.0
-                    else:
-                        pnl_total = (current_strategy_value - fill_price) * 100 * qty
-                        pnl_pct = (pnl_total / (fill_price * 100 * qty)) * 100 if abs(fill_price)>0.01 else 0.0
-                    t_enhanced['live_pnl'] = pnl_total
-                    t_enhanced['live_pnl_pct'] = pnl_pct
-                    t_enhanced['current_val'] = current_strategy_value
-                else: t_enhanced['live_pnl'] = None 
-            except Exception as e: t_enhanced['live_pnl'] = None
+        status_str = str(t.get('status', '')).strip().upper()
+        
+        try:
+            legs = t.get('legs', [])
+            strat_type = str(t.get('strategy', '')).upper()
+            tags = str(t.get('tags', '')).upper()
+            is_credit = any(k in strat_type or k in tags for k in CREDIT_KEYWORDS)
+            current_strategy_value = 0.0
+            all_legs_valid = True
+            live_legs = []
+            
+            # [CRITICAL FIX] Always loop through legs to get prices, regardless of status
+            for leg in legs:
+                l_copy = dict(leg)
+                exp = l_copy.get('exp_date')
+                strike = float(l_copy.get('strike'))
+                op_type = l_copy.get('op_type') 
+                action = l_copy.get('action')   
+                
+                # 1. Prepare Entry Price
+                try:
+                    raw_ep = l_copy.get('entry_price', 0.0)
+                    if raw_ep is None: raw_ep = 0.0
+                    entry_px = float(raw_ep)
+                except: entry_px = 0.0
+                
+                # 2. Fetch Live Price (Crucial for Fill)
+                leg_price = 0.0
+                chain_data = sniper_client._fetch_chain_one_exp(t['symbol'], exp)
+                side_key = "callExpDateMap" if op_type.upper() == "CALL" else "putExpDateMap"
+                q_data = sniper_client._extract_quote(chain_data, side_key, exp, strike)
+                
+                if q_data:
+                    bid = float(q_data.get('bid', 0))
+                    ask = float(q_data.get('ask', 0))
+                    mark = float(q_data.get('mark', 0))
+                    if mark > 0: leg_price = mark
+                    elif bid > 0 and ask > 0: leg_price = (bid + ask) / 2.0
+                    else: leg_price = 0.0
+                else:
+                    all_legs_valid = False
+                
+                # 3. Add to Strategy Value (for PnL calc)
+                side_mult = 1 if str(action).upper() == 'BUY' else -1
+                current_strategy_value += (leg_price * side_mult)
+                
+                # 4. Calculate PnL (ONLY if OPEN)
+                l_copy['leg_pnl'] = None
+                if status_str == 'OPEN':
+                    if entry_px > 0.001:
+                        # Logic: Current Price - Entry Price (for Display)
+                        # Does not multiply by 100 or Qty for per-unit display
+                        if str(action).upper() == 'BUY': 
+                            l_pnl = leg_price - entry_px
+                        else: 
+                            l_pnl = entry_px - leg_price
+                        l_copy['leg_pnl'] = l_pnl
+
+                l_copy['live_price'] = leg_price
+                live_legs.append(l_copy)
+            
+            t_enhanced['legs'] = live_legs
+            
+            # 5. Calculate Total PnL (Only if OPEN and all legs valid)
+            if status_str == 'OPEN' and all_legs_valid:
+                fill_price = float(t.get('initial_cost') or 0.0)
+                qty = int(t.get('quantity') or 1)
+                
+                if is_credit:
+                    pnl_total = (fill_price + current_strategy_value) * 100 * qty
+                    pnl_pct = (pnl_total / (abs(fill_price) * 100 * qty)) * 100 if abs(fill_price)>0.01 else 0.0
+                else:
+                    pnl_total = (current_strategy_value - fill_price) * 100 * qty
+                    pnl_pct = (pnl_total / (fill_price * 100 * qty)) * 100 if abs(fill_price)>0.01 else 0.0
+                
+                t_enhanced['live_pnl'] = pnl_total
+                t_enhanced['live_pnl_pct'] = pnl_pct
+                t_enhanced['current_val'] = current_strategy_value
+            else: 
+                t_enhanced['live_pnl'] = None 
+        
+        except Exception as e: 
+            t_enhanced['live_pnl'] = None
+        
         enhanced_trades.append(t_enhanced)
     return enhanced_trades
 
@@ -305,7 +341,6 @@ if os.path.exists(db_path):
 
         c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1])
         
-        # [MODIFIED] Large VIX
         with c1:
             st.markdown(f"""
                 <div style="background-color: #262730; padding: 8px 12px; border-radius: 5px; border-left: 5px solid {vix_color};">
@@ -314,7 +349,6 @@ if os.path.exists(db_path):
                 </div>
             """, unsafe_allow_html=True)
             
-        # [MODIFIED] Small Last Scan
         with c2:
             st.caption("Last Scan")
             st.markdown(f"<span style='font-size: 1.1rem; font-weight: bold;'>{ts.split(' ')[1]}</span>", unsafe_allow_html=True)
@@ -548,9 +582,13 @@ with tab_manager:
                         c_a.write(icon)
                         c_b.caption(f"**{act} {ratio}x** {exp} **{strike} {op_type}**")
                         if live_px is not None: c_c.caption(f"Mkt ${live_px:.2f}")
+                        
+                        # [FIXED] PnL Display Logic
                         if leg_pnl is not None: 
-                            p_col = "green" if leg_pnl >=0 else "red"
-                            c_d.markdown(f":{p_col}[${leg_pnl:.0f}]")
+                            p_color = "#00c853" if leg_pnl >= 0 else "#f44336"
+                            c_d.markdown(f"<span style='color:{p_color}; font-weight:bold'>${leg_pnl:.2f}</span>", unsafe_allow_html=True)
+                        else:
+                            c_d.markdown(f"<span style='color:#555; font-size:0.8rem;'>--</span>", unsafe_allow_html=True)
                 
                 # Buttons
                 c_act1, c_act2, c_act3, c_act4 = st.columns([1, 1, 3, 1])
