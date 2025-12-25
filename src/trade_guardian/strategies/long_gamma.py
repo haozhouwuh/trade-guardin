@@ -87,6 +87,14 @@ class LongGammaStrategy(Strategy):
         tsf = ctx.tsf
         symbol = ctx.symbol
         price = float(ctx.price)
+
+        # ============ [DEBUG START] ============
+        # 打印 TSF 里的核心数据，看看是不是这里就是 0
+        # s_dte = tsf.get("short_dte", "None")
+        # s_iv = tsf.get("short_iv", "None")
+        # print(f"🧐 [DEBUG-LOGIC] {symbol} Checking LG Logic...")
+        # print(f"   -> TSF Data: DTE={s_dte}, IV={s_iv}, EdgeM={tsf.get('edge_micro')}")
+        # ============ [DEBUG END] ==============
         
         short_iv = float(tsf.get("short_iv", 0.0))
         edge_micro = float(tsf.get("edge_micro", 0.0))
@@ -100,6 +108,9 @@ class LongGammaStrategy(Strategy):
         has_catalyst = False 
         
         if short_dte < min_dte and not has_catalyst:
+            # ============ [DEBUG START] ============
+            #print(f"   🚫 [BLOCK] DTE Kill: {short_dte} < {min_dte}")
+            # ============ [DEBUG END] ==============
             return self._empty_row(ctx, f"DTE {short_dte} < {min_dte} (Theta Risk)")
 
         # 2. Pin Risk Hard Kill (Data-Driven)

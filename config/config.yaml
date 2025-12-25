@@ -15,8 +15,8 @@ rules:
   min_edge_short_base: 1.05
 
   # [Long Gamma] 硬性风控参数
-  lg_min_dte_etf: 7
-  lg_min_dte_stock: 10
+  lg_min_dte_etf: 5
+  lg_min_dte_stock: 7
   lg_max_spread_pct: 0.08
 
   # [Risk Caps]
@@ -78,8 +78,8 @@ policy:
 strategies:
   diagonal:
     use_rank_0_for_short: true
-    short_min_dte: 1
-    short_max_dte: 14
+    short_min_dte: 3
+    short_max_dte: 15
   
   hv_calendar:
     hv_rules:

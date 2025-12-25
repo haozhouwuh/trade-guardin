@@ -259,11 +259,12 @@ class TradeGuardian:
 
             except Exception as e:
                 print(f"❌ CRASH on {ticker}: {e}")
-                import traceback
-
-                traceback.print_exc()
+                # import traceback
+                # traceback.print_exc()
                 continue
 
+        # [重要] 只有当本次扫描至少有一个成功结果时，才更新 last_batch_df
+        # 否则动能计算会因为对比空数据而混乱
         if current_rows_for_next_batch:
             self.last_batch_df = pd.DataFrame(current_rows_for_next_batch)
 
@@ -277,6 +278,20 @@ class TradeGuardian:
             avg_abs_edge = total_abs_edge / len(valid_rows)
             cheap_count = sum(1 for r in valid_rows if float(r.edge) > 0)
             cheap_vol_pct = cheap_count / len(valid_rows)
+
+        # =========================================================================
+        # [FIX] 数据库熔断机制 (DB Circuit Breaker)
+        # 核心逻辑：如果 ticker 列表不为空，但有效结果(valid_rows) 为 0，
+        # 说明遭遇了系统性故障（如 Token 失效、断网）。
+        # 此时禁止保存空批次，防止 Dashboard 被“洗白”。
+        # =========================================================================
+        if not valid_rows and len(tickers) > 0:
+            print("\n" + "=" * WIDTH)
+            print(f"⛔ {Fore.RED}CRITICAL: System Failure Detected (0 Results).{Style.RESET_ALL}")
+            print(f"   Possible Causes: API Token Expired / Network Down / Data Error")
+            print(f"   🛡️  Action: DB Save SKIPPED to preserve Dashboard history.")
+            print("=" * WIDTH + "\n")
+            return  # <--- 直接返回，不执行 save_scan_session
 
         self.db.save_scan_session(
             strategy_name, current_vix, len(tickers), avg_abs_edge, cheap_vol_pct, elapsed, db_results_pack
@@ -356,7 +371,7 @@ class TradeGuardian:
     # -------------------------
     # Gate Logic (ALWAYS returns tuple)
     # -------------------------
-    def _get_gate_status(self, row: ScanRow, bp: Optional[Blueprint], dna_type: str) -> Tuple[str, str]:
+    def _get_gate_status(self, row: ScanRow, bp: Blueprint, dna_type: str) -> Tuple[str, str]:
         status = "WAIT"
         reason = "Score/Structure suboptimal"
 
@@ -431,7 +446,7 @@ class TradeGuardian:
                         status, reason = "LIMIT", "Structure OK"
 
             # --- Vertical ---
-            elif ("BULL" in tag) or ("BEAR" in tag) or ("VERT" in tag):
+            elif ("BULL" in tag) or ("BEAR" in tag) or ("VERT" in tag) or ("IC" in tag):
                 if int(getattr(row, "cal_score", 0) or 0) >= 60:
                     status, reason = "LIMIT", "Vertical Setup OK"
                 else:

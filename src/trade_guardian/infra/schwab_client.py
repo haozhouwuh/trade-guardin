@@ -194,6 +194,17 @@ class SchwabClient:
         chain = self._fetch_chain(symbol, from_date, to_date, range_val="ALL")
         call_map = chain.get("callExpDateMap") or {}
 
+        # ============ [DEBUG START] ============
+        # print(f"\n🔍 [DEBUG-DATA] {symbol}: Raw Chain Received.")
+        # if not call_map:
+        #     print(f"   ❌ Call Map is EMPTY! API returned: {str(chain)[:100]}...")
+        # else:
+        #     exp_dates = list(call_map.keys())
+        #     print(f"   ✅ Found {len(exp_dates)} Expirations. Range: {exp_dates[0]} ~ {exp_dates[-1]}")
+        # ============ [DEBUG END] ==============
+
+
+
         term: List[TermPoint] = []
         TOP_N_STRIKES = int(self.cfg.get("scan", {}).get("atm_probe_strikes", 6) or 6)
 

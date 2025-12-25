@@ -66,9 +66,10 @@ st.markdown(
     .calc-price { font-size: 2.4rem; font-weight: 700; color: #4caf50; font-family: 'Roboto Mono', monospace; line-height: 1; }
     .calc-sub { font-size: 0.9rem; color: #aaa; margin-top: 5px; }
 
-    div.row-widget.stRadio > div { flex-direction: row; gap: 5px; }
+    /* Radio Button 垂直排列 */
+    div.row-widget.stRadio > div { flex-direction: column; gap: 8px; }
     div.row-widget.stRadio > div[role="radiogroup"] > label {
-        background-color: #262730; border: 1px solid #444; padding: 5px 10px;
+        background-color: #262730; border: 1px solid #444; padding: 10px 10px;
         border-radius: 4px; flex: 1; text-align: center; justify-content: center;
     }
 </style>
@@ -133,8 +134,6 @@ def load_radar_with_deltas():
         id_10m = get_past_batch_id(conn, curr_ts, 10)
         id_1h = get_past_batch_id(conn, curr_ts, 60)
 
-        # ✅ NEW: rank_score 用于排序（WAIT 罚分），但 UI 仍显示 cal_score
-        # 你可以随时调整这些常数：WAIT 更靠后就把 -40 改成 -80 等。
         query_main = """
             SELECT
                 s.symbol, s.price, s.iv_short, s.edge, s.regime,
@@ -174,8 +173,9 @@ def load_radar_with_deltas():
             merged = df.merge(df_1h, on="symbol", how="left", suffixes=("", "_old"))
             df["d_1h"] = merged["price"] - merged["price_old"]
 
-        df["d_10m"] = df["d_10m"].fillna(0.0)
-        df["d_1h"] = df["d_1h"].fillna(0.0)
+        # [FIX] 解决 Pandas FutureWarning: 先转为 numeric 再 fillna，避免隐式 downcast 警告
+        df["d_10m"] = pd.to_numeric(df["d_10m"], errors='coerce').fillna(0.0)
+        df["d_1h"] = pd.to_numeric(df["d_1h"], errors='coerce').fillna(0.0)
 
         return df, (curr_ts, vix)
     finally:
@@ -247,7 +247,6 @@ if df is not None:
     display_df["Δ10m"] = display_df["d_10m"].apply(format_delta)
     display_df["Δ1h"] = display_df["d_1h"].apply(format_delta)
 
-    # 注意：rank_score 不展示，只用于排序（已经在 SQL 里排好了）
     cols = [
         "symbol", "price", "Δ10m", "Δ1h", "iv_short", "edge", "regime",
         "strategy_type", "tag", "gate_status", "cal_score", "blueprint_json"
@@ -313,8 +312,20 @@ if df is not None:
                     legs = bp_data.get("legs", [])
                     if legs:
                         bp_valid = True
-                        if "DIAGONAL" in str(row["strategy_type"]).upper() or "DIAGONAL" in str(row["tag"]).upper():
-                            target_strategy = "DIAGONAL"
+                        
+                        # [FIX] 增强的策略识别逻辑
+                        # 不仅看 DIAGONAL，还要看 BULL/BEAR/VERT 等双腿策略
+                        strat_name = str(row["strategy_type"]).upper()
+                        tag_name = str(row["tag"]).upper()
+                        
+                        # 定义所有需要双腿处理的关键词
+                        multi_leg_kws = ["DIAGONAL", "PMCC", "BULL", "BEAR", "VERT", "PCS", "CCS", "IC", "IRON", "CONDOR"]
+                        is_multi_leg = any(k in strat_name or k in tag_name for k in multi_leg_kws)
+
+                        if is_multi_leg:
+                            # 传递真实的策略名称给 Sniper (e.g. BULL-PUT)
+                            target_strategy = row["strategy_type"] 
+                            
                             for leg in legs:
                                 cls = "leg-buy" if leg["action"] == "BUY" else "leg-sell"
                                 icon = "🟢" if leg["action"] == "BUY" else "🔴"
@@ -322,6 +333,7 @@ if df is not None:
                                     f"""<div class="blueprint-box {cls}"><span>{icon} <b>{leg['action']} {leg['ratio']}x</b></span><span>{leg['exp']}</span><span><b>{leg['strike']} {leg['type']}</b></span></div>""",
                                     unsafe_allow_html=True
                                 )
+                                # 提取 Short / Long 参数
                                 if leg["action"] == "SELL":
                                     short_exp = leg["exp"]
                                     short_strike = float(leg["strike"])
@@ -329,6 +341,7 @@ if df is not None:
                                     long_exp = leg["exp"]
                                     long_strike = float(leg["strike"])
                         else:
+                            # 默认为 STRADDLE / LG
                             target_strategy = "STRADDLE"
                             for leg in legs:
                                 cls = "leg-buy" if leg["action"] == "BUY" else "leg-sell"
@@ -343,10 +356,11 @@ if df is not None:
                     st.error(f"Blueprint Error: {e}")
 
             st.divider()
+            
             urgency = st.radio(
                 "Pricing Mode",
                 ["PASSIVE", "NEUTRAL", "AGGRESSIVE"],
-                horizontal=True,
+                horizontal=False, 
                 label_visibility="collapsed"
             )
 
@@ -358,10 +372,10 @@ if df is not None:
                     if sniper:
                         res = sniper.lock_target(
                             symbol=symbol,
-                            strategy=target_strategy,
+                            strategy=target_strategy, # [FIX] 现在这里会正确传递 BULL-PUT
                             short_exp=short_exp,
                             short_strike=short_strike,
-                            long_exp=long_exp,
+                            long_exp=long_exp,     # [FIX] 双腿策略会正确传递 Long Leg
                             long_strike=long_strike,
                             urgency=urgency
                         )
@@ -372,7 +386,7 @@ if df is not None:
                         else:
                             st.error(res.get("msg", "Sniper returned FAIL"))
                     else:
-                        st.error("Sniper not initialized. Check config/config.yaml path & load_config.")
+                        st.error("Sniper not initialized. Check config/config.yaml")
                 except Exception as e:
                     st.error(f"Pricing Error: {e}")
 
