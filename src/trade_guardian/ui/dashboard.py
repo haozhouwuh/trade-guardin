@@ -21,7 +21,7 @@ from trade_guardian.action.sniper import Sniper
 from trade_guardian.app.persistence import PersistenceManager
 
 # ==========================================
-# 2. 页面配置 & CSS
+# 2. 页面配置 & CSS (Compact Mode)
 # ==========================================
 st.set_page_config(
     page_title="Trade Guardian",
@@ -36,54 +36,83 @@ if "last_refresh_time" not in st.session_state:
 st.markdown(
     """
 <style>
-    .block-container { padding-top: 1rem !important; padding-bottom: 1rem !important; }
-    .stProgress > div > div > div > div { background-color: #f63366; }
+    /* Global Compact */
+    .block-container { padding-top: 0.5rem !important; padding-bottom: 1rem !important; }
     
-    /* Sidebar Header */
+    /* Compact Sidebar */
     .sidebar-header {
         display: flex; justify-content: space-between; align-items: center;
-        background-color: #262730; padding: 10px 5px; border-radius: 6px; border: 1px solid #444; margin-bottom: 15px;
+        background-color: #262730; padding: 6px 4px; border-radius: 4px; border: 1px solid #444; margin-bottom: 10px;
     }
-    .header-item { flex: 1; text-align: center; border-right: 1px solid #555; line-height: 1.2; }
+    .header-item { flex: 1; text-align: center; border-right: 1px solid #555; line-height: 1.1; }
     .header-item:last-child { border-right: none; }
-    .header-label { font-size: 0.7rem; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
-    .header-value { font-size: 1rem; font-weight: 700; color: #eee; white-space: nowrap; }
+    .header-label { font-size: 0.65rem; color: #aaa; text-transform: uppercase; margin-bottom: 1px; }
+    .header-value { font-size: 0.85rem; font-weight: 700; color: #eee; }
 
-    /* Blueprint Box (Sidebar) */
+    /* Compact Blueprint Box */
     .blueprint-box {
-        font-size: 0.85rem; background-color: #1e1e1e; border: 1px solid #333;
-        border-radius: 4px; padding: 8px 12px; margin-bottom: 6px;
+        font-size: 0.75rem; background-color: #1e1e1e; border: 1px solid #333;
+        border-radius: 3px; padding: 4px 8px; margin-bottom: 4px;
         display: flex; justify-content: space-between;
     }
-    .leg-buy { border-left: 4px solid #00c853; }
-    .leg-sell { border-left: 4px solid #f44336; }
+    .leg-buy { border-left: 3px solid #00c853; }
+    .leg-sell { border-left: 3px solid #f44336; }
 
-    /* Calc Box */
+    /* Compact Calc Box */
     .calc-box {
-        background-color: #0e1117; border: 1px solid #4caf50; border-radius: 8px;
-        padding: 15px; text-align: center; margin-top: 15px; margin-bottom: 15px;
-        box-shadow: 0 0 10px rgba(76, 175, 80, 0.1);
+        background-color: #0e1117; border: 1px solid #4caf50; border-radius: 6px;
+        padding: 8px; text-align: center; margin-top: 10px; margin-bottom: 10px;
     }
-    .calc-title { color: #888; font-size: 0.8rem; letter-spacing: 1px; margin-bottom: 5px; }
-    .calc-price { font-size: 2.4rem; font-weight: 700; color: #4caf50; font-family: 'Roboto Mono', monospace; line-height: 1; }
-    .calc-sub { font-size: 0.9rem; color: #aaa; margin-top: 5px; }
+    .calc-title { color: #888; font-size: 0.7rem; margin-bottom: 2px; }
+    .calc-price { font-size: 1.8rem; font-weight: 700; color: #4caf50; font-family: 'Roboto Mono', monospace; line-height: 1; }
+    .calc-sub { font-size: 0.8rem; color: #aaa; margin-top: 2px; }
 
-    /* Trade Manager Card */
-    .trade-card {
-        background-color: #1e1e1e; border: 1px solid #444; border-radius: 8px; padding: 15px; margin-bottom: 15px;
+    /* === Compact Trade Card Styles === */
+    .compact-card {
+        background-color: #161616; border: 1px solid #333; border-radius: 4px; 
+        margin-bottom: 8px; padding: 0; overflow: hidden;
     }
-    .trade-status-working { border-left: 5px solid #ffeb3b; }
-    .trade-status-open { border-left: 5px solid #00c853; }
     
-    /* Leg Details inside Card */
-    .card-leg-row {
-        display: flex; justify-content: flex-start; align-items: center; 
-        font-family: monospace; font-size: 0.85rem; margin-top: 4px;
-        color: #ddd;
+    /* Status Strip */
+    .status-strip-working { border-left: 4px solid #ffeb3b; }
+    .status-strip-open { border-left: 4px solid #00c853; }
+    .status-strip-closed { border-left: 4px solid #9e9e9e; }
+
+    /* Header Row */
+    .card-header {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 6px 12px; background-color: #1e1e1e; border-bottom: 1px solid #2a2a2a;
     }
-    .badge-buy { background-color: #00c853; color: black; padding: 1px 6px; border-radius: 3px; font-weight: bold; margin-right: 8px; font-size: 0.75rem; }
-    .badge-sell { background-color: #f44336; color: white; padding: 1px 6px; border-radius: 3px; font-weight: bold; margin-right: 8px; font-size: 0.75rem; }
-    .leg-meta { margin-right: 12px; }
+    .sym-box { display: flex; align-items: baseline; gap: 8px; }
+    .sym-text { font-size: 1rem; font-weight: 700; color: #eee; }
+    .strat-text { font-size: 0.75rem; color: #888; background: #2a2a2a; padding: 1px 5px; border-radius: 3px; }
+    .id-text { font-size: 0.7rem; color: #555; margin-left: 8px; }
+    
+    .metrics-box { display: flex; align-items: center; gap: 15px; }
+    .metric-item { text-align: right; line-height: 1.1; }
+    .metric-val { font-size: 0.95rem; font-weight: 700; color: #ddd; font-family: 'Roboto Mono', monospace; }
+    .metric-lbl { font-size: 0.65rem; color: #777; }
+    .pnl-pos { color: #00c853; }
+    .pnl-neg { color: #f44336; }
+    .t-pnl-neutral { color: #777; font-family: 'Roboto Mono', monospace; font-size: 0.95rem; }
+
+    .status-badge {
+        padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 0.7rem; text-transform: uppercase;
+    }
+
+    /* Legs Section */
+    .legs-container { padding: 4px 12px; background-color: #161616; }
+    .leg-row {
+        display: flex; justify-content: flex-start; align-items: center;
+        padding: 2px 0; font-size: 0.8rem; font-family: 'Roboto Mono', monospace; color: #bbb;
+    }
+    .leg-icon { font-size: 0.6rem; margin-right: 6px; width: 12px; text-align: center; }
+    .leg-desc { flex: 1; }
+    .leg-price { width: 80px; text-align: right; color: #888; font-size: 0.75rem; }
+    .leg-pnl { width: 80px; text-align: right; font-weight: bold; font-size: 0.75rem; }
+
+    /* Action Bar */
+    .action-bar { padding: 4px 12px 8px 12px; }
     
 </style>
 """,
@@ -146,7 +175,6 @@ def load_radar_with_deltas():
         id_10m = get_past_batch_id(conn, curr_ts, 10)
         id_1h = get_past_batch_id(conn, curr_ts, 60)
 
-        # [MODIFIED] Added s.snapshot_id for trade tracking
         query_main = """
             SELECT
                 s.snapshot_id,
@@ -186,112 +214,69 @@ def load_radar_with_deltas():
     finally:
         conn.close()
 
-# [MODIFIED V2] Calculate Live PnL Logic (Database Legs Support)
 def calculate_live_pnl(trades, sniper_client):
     if not trades or not sniper_client:
         return trades or []
-    
     enhanced_trades = []
-    
-    # Credit Strategies Keywords
     CREDIT_KEYWORDS = ["BULL-PUT", "BEAR-CALL", "CREDIT", "IC", "IRON", "CONDOR", "VERTICAL"]
-
     for t in trades:
-        # t is a dict from sqlite3.Row
         t_enhanced = dict(t)
-        
-        # Only calculate PnL for OPEN trades
         if t['status'] == 'OPEN':
             try:
-                # [NEW V2] Legs are already list of dicts from PersistenceManager
                 legs = t.get('legs', [])
-                
-                # Check Strategy Type (Credit vs Debit)
                 strat_type = str(t.get('strategy', '')).upper()
                 tags = str(t.get('tags', '')).upper()
                 is_credit = any(k in strat_type or k in tags for k in CREDIT_KEYWORDS)
-                
                 current_strategy_value = 0.0
                 all_legs_valid = True
-                
-                # We need to update leg prices in place
                 live_legs = []
-
                 for leg in legs:
-                    # Persistence returns dict, we can modify or copy
                     l_copy = dict(leg)
-                    
-                    # Columns in trade_legs table: exp_date, strike, op_type, action
                     exp = l_copy.get('exp_date')
                     strike = float(l_copy.get('strike'))
-                    op_type = l_copy.get('op_type') # CALL/PUT
-                    action = l_copy.get('action')   # BUY/SELL
-                    
+                    op_type = l_copy.get('op_type') 
+                    action = l_copy.get('action')   
+                    entry_px = float(l_copy.get('entry_price', 0.0) or 0.0)
                     chain_data = sniper_client._fetch_chain_one_exp(t['symbol'], exp)
                     side_key = "callExpDateMap" if op_type.upper() == "CALL" else "putExpDateMap"
                     q_data = sniper_client._extract_quote(chain_data, side_key, exp, strike)
-                    
                     leg_price = 0.0
                     if q_data:
                         bid = float(q_data.get('bid', 0))
                         ask = float(q_data.get('ask', 0))
                         mark = float(q_data.get('mark', 0))
-                        
-                        if bid > 0 and ask > 0:
-                            mid = (bid + ask) / 2.0
-                        elif mark > 0:
-                            mid = mark
-                        else:
-                            mid = 0.0
-                        
+                        if bid > 0 and ask > 0: mid = (bid + ask) / 2.0
+                        elif mark > 0: mid = mark
+                        else: mid = 0.0
                         leg_price = mid
-                        
-                        # Market Value Contribution:
-                        # Buy Leg = +Value (Asset)
-                        # Sell Leg = -Value (Liability)
                         side_mult = 1 if action.upper() == 'BUY' else -1
                         current_strategy_value += (mid * side_mult)
-                    else:
-                        all_legs_valid = False
-                        
-                    # [NEW] Inject live price into leg dict
+                        if t['status'] == 'OPEN' and entry_px > 0:
+                            if action.upper() == 'BUY': l_pnl = (leg_price - entry_px) * 100 * int(t.get('quantity', 1))
+                            else: l_pnl = (entry_px - leg_price) * 100 * int(t.get('quantity', 1))
+                            l_copy['leg_pnl'] = l_pnl
+                        else: l_copy['leg_pnl'] = None
+                    else: all_legs_valid = False
                     l_copy['live_price'] = leg_price
                     live_legs.append(l_copy)
-                
-                # Replace original legs with enriched legs
                 t_enhanced['legs'] = live_legs
-
-                if all_legs_valid:
-                    fill_price = float(t['initial_cost'] or 0.0) # V2 field is initial_cost
+                if t['status'] == 'OPEN' and all_legs_valid:
+                    fill_price = float(t['initial_cost'] or 0.0)
                     qty = int(t['quantity'] or 1)
-                    
-                    # PnL Logic
                     if is_credit:
                         pnl_total = (fill_price + current_strategy_value) * 100 * qty
-                        if abs(fill_price) > 0.01:
-                            pnl_pct = (pnl_total / (abs(fill_price) * 100 * qty)) * 100
-                        else:
-                            pnl_pct = 0.0
+                        pnl_pct = (pnl_total / (abs(fill_price) * 100 * qty)) * 100 if abs(fill_price)>0.01 else 0.0
                     else:
                         pnl_total = (current_strategy_value - fill_price) * 100 * qty
-                        if abs(fill_price) > 0.01:
-                            pnl_pct = (pnl_total / (fill_price * 100 * qty)) * 100
-                        else:
-                            pnl_pct = 0.0
-                    
+                        pnl_pct = (pnl_total / (fill_price * 100 * qty)) * 100 if abs(fill_price)>0.01 else 0.0
                     t_enhanced['live_pnl'] = pnl_total
                     t_enhanced['live_pnl_pct'] = pnl_pct
                     t_enhanced['current_val'] = current_strategy_value
-                else:
-                    t_enhanced['live_pnl'] = None 
-                    
-            except Exception as e:
-                # print(f"PnL Error: {e}")
-                t_enhanced['live_pnl'] = None
-        
+                else: t_enhanced['live_pnl'] = None 
+            except Exception as e: t_enhanced['live_pnl'] = None
         enhanced_trades.append(t_enhanced)
-        
     return enhanced_trades
+
 
 # ==========================================
 # 4. 主 UI 逻辑
@@ -318,25 +303,31 @@ if os.path.exists(db_path):
         elif vix_val >= 25:
             vix_color = "#f44336"; vix_label = "PANIC"
 
-        col1, col2, col3, col4 = st.columns([2, 1.5, 1.5, 1])
-        col1.markdown(f"""
-            <div style="background-color: #262730; padding: 10px; border-radius: 5px; border-left: 5px solid {vix_color};">
-                <div style="font-size: 0.8rem; color: #aaa;">MARKET VIX</div>
-                <div style="font-size: 1.5rem; font-weight: bold; color: white;">{vix:.2f} <span style="font-size:0.8rem; color:{vix_color}">({vix_label})</span></div>
-            </div>
+        c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1])
+        
+        # [MODIFIED] Large VIX
+        with c1:
+            st.markdown(f"""
+                <div style="background-color: #262730; padding: 8px 12px; border-radius: 5px; border-left: 5px solid {vix_color};">
+                    <div style="font-size: 0.75rem; color: #aaa; text-transform: uppercase;">Market VIX</div>
+                    <div style="font-size: 2.0rem; font-weight: bold; color: white; line-height: 1;">{vix:.2f} <span style="font-size:0.9rem; color:{vix_color}">({vix_label})</span></div>
+                </div>
             """, unsafe_allow_html=True)
-        col2.metric("Last Scan", ts.split(" ")[1])
-        if col4.button("🔄 Refresh All"):
-            load_radar_with_deltas.clear()
-            st.rerun()
+            
+        # [MODIFIED] Small Last Scan
+        with c2:
+            st.caption("Last Scan")
+            st.markdown(f"<span style='font-size: 1.1rem; font-weight: bold;'>{ts.split(' ')[1]}</span>", unsafe_allow_html=True)
 
-# -----------------
-# Tabs
-# -----------------
-tab_scanner, tab_manager = st.tabs(["📡 Scanner (Radar)", "💼 Active Trades (Manager)"])
+        with c4:
+            if st.button("🔄"):
+                load_radar_with_deltas.clear()
+                st.rerun()
+
+tab_scanner, tab_manager = st.tabs(["📡 Scanner", "💼 Active Trades"])
 
 # ==========================================
-# TAB 1: Scanner (Radar)
+# TAB 1: Scanner (保持不变，只是 Sidebar 微调)
 # ==========================================
 with tab_scanner:
     if "auto_refresh" not in st.session_state:
@@ -361,19 +352,17 @@ with tab_scanner:
         column_cfg = {
             "blueprint_json": None,
             "cal_score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
-            "symbol": st.column_config.TextColumn("Symbol", width="small"),
-            "price": st.column_config.NumberColumn("Price", format="$%.2f"),
+            "symbol": st.column_config.TextColumn("Sym", width="small"),
+            "price": st.column_config.NumberColumn("Px", format="$%.2f"),
             "edge": st.column_config.NumberColumn("Edge", format="%.2f"),
             "iv_short": st.column_config.NumberColumn("IV", format="%.1f%%"),
         }
 
-        # Main Table
         event = st.dataframe(
             display_df, width="stretch", hide_index=True, column_config=column_cfg,
             selection_mode="single-row", on_select="rerun", height=600, key="radar_table"
         )
 
-        # --- Sidebar (Action Panel) ---
         if len(event.selection.rows) > 0:
             selected_index = event.selection.rows[0]
             row = df.iloc[selected_index]
@@ -382,20 +371,18 @@ with tab_scanner:
             snapshot_id = int(row.get("snapshot_id", 0))
 
             with st.sidebar:
-                st.markdown(f"## 🔭 Scope: **{symbol}**")
-                
+                st.markdown(f"#### 🔭 {symbol}")
                 gate_color = "#00c853" if row["gate_status"] == "EXEC" else ("#ffeb3b" if row["gate_status"] == "LIMIT" else "#f44336")
                 st.markdown(f"""
 <div class="sidebar-header">
-<div class="header-item"><div class="header-label">STRATEGY</div><div class="header-value">{row['strategy_type']}</div></div>
+<div class="header-item"><div class="header-label">TYPE</div><div class="header-value">{row['strategy_type'][:8]}</div></div>
 <div class="header-item"><div class="header-label">TAG</div><div class="header-value">{row['tag']}</div></div>
 <div class="header-item"><div class="header-label">GATE</div><div class="header-value" style="color: {gate_color};">{row['gate_status']}</div></div>
 </div>
 """, unsafe_allow_html=True)
 
                 bp_valid = False
-                short_exp, short_strike = None, 0.0
-                long_exp, long_strike = None, 0.0
+                short_exp, short_strike, long_exp, long_strike = None, 0.0, None, 0.0
                 target_strategy = "STRADDLE"
 
                 if bp_json_raw:
@@ -413,208 +400,166 @@ with tab_scanner:
                                 target_strategy = row["strategy_type"]
                                 for leg in legs:
                                     cls = "leg-buy" if leg["action"] == "BUY" else "leg-sell"
-                                    icon = "🟢" if leg["action"] == "BUY" else "🔴"
-                                    # [FIXED HTML INDENT]
-                                    st.markdown(f"""<div class="blueprint-box {cls}"><span>{icon} <b>{leg['action']} {leg['ratio']}x</b></span><span>{leg['exp']}</span><span><b>{leg['strike']} {leg['type']}</b></span></div>""", unsafe_allow_html=True)
+                                    icon = "B" if leg["action"] == "BUY" else "S"
+                                    st.markdown(f"""<div class="blueprint-box {cls}"><span><b>{icon} {leg['ratio']}x</b> {leg['exp']}</span><span>{leg['strike']} {leg['type']}</span></div>""", unsafe_allow_html=True)
                                     if leg["action"] == "SELL": short_exp = leg["exp"]; short_strike = float(leg["strike"])
                                     elif leg["action"] == "BUY": long_exp = leg["exp"]; long_strike = float(leg["strike"])
                             else:
                                 target_strategy = "STRADDLE"
                                 for leg in legs:
                                     cls = "leg-buy" if leg["action"] == "BUY" else "leg-sell"
-                                    # [FIXED HTML INDENT]
-                                    st.markdown(f"""<div class="blueprint-box {cls}"><span>{leg['action']} {leg['ratio']}x</span><span>{leg['exp']}</span><span><b>{leg['strike']} {leg['type']}</b></span></div>""", unsafe_allow_html=True)
+                                    st.markdown(f"""<div class="blueprint-box {cls}"><span><b>{leg['action']}</b> {leg['exp']}</span><span>{leg['strike']} {leg['type']}</span></div>""", unsafe_allow_html=True)
                                 if legs: short_exp = legs[0]["exp"]; short_strike = float(legs[0]["strike"])
-                    except Exception as e:
-                        st.error(f"Blueprint Error: {e}")
+                    except: st.error("Blueprint Error")
 
                 st.divider()
-                urgency = st.radio("Pricing Mode", ["PASSIVE", "NEUTRAL", "AGGRESSIVE"], horizontal=False, label_visibility="collapsed")
+                urgency = st.radio("Pricing", ["PASSIVE", "NEUTRAL", "AGGRESSIVE"], horizontal=True, label_visibility="collapsed")
                 limit_price_display, est_cost_display, is_ready, limit_price_val = "---", "---", False, 0.0
 
                 if bp_valid and short_exp:
                     try:
                         sniper = get_sniper()
                         if sniper:
-                            res = sniper.lock_target(
-                                symbol=symbol, strategy=target_strategy, short_exp=short_exp, short_strike=short_strike,
-                                long_exp=long_exp, long_strike=long_strike, urgency=urgency
-                            )
+                            res = sniper.lock_target(symbol, target_strategy, short_exp, short_strike, long_exp, long_strike, urgency)
                             if res.get("status") == "READY":
                                 is_ready = True
                                 limit_price_val = res['limit_price']
                                 limit_price_display = f"${limit_price_val:.2f}"
                                 est_cost_display = f"${res['est_cost']:.0f}"
-                            else:
-                                st.error(res.get("msg", "Sniper FAIL"))
-                        else:
-                            st.error("Sniper not initialized.")
-                    except Exception as e:
-                        st.error(f"Pricing Error: {e}")
+                            else: st.error(res.get("msg", "Sniper FAIL"))
+                    except: st.error("Pricing Error")
 
-                # [FIXED HTML INDENT]
-                st.markdown(f"""<div class="calc-box"><div class="calc-title">CALCULATED LIMIT ({urgency})</div><div class="calc-price">{limit_price_display}</div><div class="calc-sub">Est. Cost: {est_cost_display}</div></div>""", unsafe_allow_html=True)
+                st.markdown(f"""<div class="calc-box"><div class="calc-title">LIMIT ({urgency})</div><div class="calc-price">{limit_price_display}</div><div class="calc-sub">Est: {est_cost_display}</div></div>""", unsafe_allow_html=True)
 
-                if st.button("💾 RECORD ORDER (DB)", type="primary", use_container_width=True, disabled=not is_ready):
+                if st.button("💾 RECORD (DB)", type="primary", use_container_width=True, disabled=not is_ready):
                     db = get_db_manager()
                     trade_id = db.record_order(
                         snapshot_id=snapshot_id, symbol=symbol, strategy=target_strategy,
                         limit_price=limit_price_val, quantity=1, blueprint_json=bp_json_raw,
                         tags=row['tag'], underlying_price=float(row['price']), iv=float(row['iv_short'])
                     )
-                    if trade_id: st.toast(f"✅ Order Recorded! ID: {trade_id}", icon="💾"); time.sleep(1); st.rerun()
-                    else: st.error("DB Save Failed")
+                    if trade_id: st.toast(f"Recorded! ID: {trade_id}", icon="💾"); time.sleep(1); st.rerun()
         else:
             with st.sidebar:
-                st.info("👈 Select a target from the radar.")
-                st.markdown("---")
-                auto_ref = st.checkbox("Auto Refresh (5min)", value=st.session_state.auto_refresh)
+                st.info("👈 Select target")
+                auto_ref = st.checkbox("Auto-Refresh", value=st.session_state.auto_refresh)
                 st.session_state.auto_refresh = auto_ref
     else:
         st.warning("⚠️ No scan data found.")
 
 # ==========================================
-# TAB 2: Active Trades (Manager)
+# TAB 2: Active Trades (COMPACT MODE)
 # ==========================================
 with tab_manager:
-    st.markdown("### 💼 Active Portfolio")
-    
-    col_k1, col_k2, col_k3 = st.columns(3)
-    
     db = get_db_manager()
     trades = db.fetch_active_trades()
     
     if not trades:
-        st.info("No active trades found. Go to 'Scanner' to fire some orders!")
+        st.caption("No active trades.")
     else:
-        # PnL Calculation
         sniper_instance = get_sniper()
         enhanced_trades = calculate_live_pnl(trades, sniper_instance)
         
-        # Summary Metrics
-        open_count = sum(1 for t in enhanced_trades if t['status'] == 'OPEN')
-        working_count = sum(1 for t in enhanced_trades if t['status'] == 'WORKING')
-        total_pnl = sum(t.get('live_pnl', 0.0) or 0.0 for t in enhanced_trades)
+        # Top Stats Row
+        c1, c2, c3, c4 = st.columns([1, 1, 2, 2])
+        open_c = sum(1 for t in enhanced_trades if t['status']=='OPEN')
+        work_c = sum(1 for t in enhanced_trades if t['status']=='WORKING')
+        tot_pnl = sum(t.get('live_pnl', 0.0) or 0.0 for t in enhanced_trades)
         
-        col_k1.metric("Open Positions", open_count)
-        col_k2.metric("Working Orders", working_count)
-        pnl_color = "normal" if total_pnl >= 0 else "inverse"
-        col_k3.metric("Unrealized PnL", f"${total_pnl:.2f}", delta=f"{total_pnl:.2f}", delta_color=pnl_color)
+        c1.metric("Open", open_c)
+        c2.metric("Working", work_c)
+        c3.metric("Unrealized PnL", f"${tot_pnl:.2f}", delta=f"{tot_pnl:.2f}", delta_color="normal" if tot_pnl>=0 else "inverse")
         
-        st.divider()
+        st.markdown("---")
 
+        # Compact Rows
         for t in enhanced_trades:
             t_id = t["trade_id"]
             sym = t["symbol"]
             strat = t["strategy"]
             status = t["status"]
-            limit = t.get("initial_cost", 0.0) # V2 field
+            limit = float(t.get("initial_cost", 0.0))
             created = t["created_at"]
             
-            # [FIXED DATE FORMAT] YYYY/MM/DD HH:MM
             try:
                 dt_obj = datetime.strptime(created, "%Y-%m-%d %H:%M:%S")
-                created_display = dt_obj.strftime("%Y/%m/%d %H:%M")
-            except:
-                created_display = created
+                created_display = dt_obj.strftime("%m/%d %H:%M")
+            except: created_display = created
 
-            # --- CARD CONTAINER ---
-            with st.container():
-                # 上半部分：Status Bar (Header)
-                status_color = "#ffeb3b" if status == "WORKING" else "#00c853"
-                border_color = status_color
-                
-                # Header HTML (Minimal, no indentation)
-                header_html = f"""
-<div style="background-color: #1e1e1e; border-left: 5px solid {border_color}; border-radius: 4px; padding: 12px; margin-bottom: 8px; border: 1px solid #333;">
-<div style="display:flex; justify-content:space-between; align-items:center;">
-<div><span style="font-size:1.1rem; font-weight:bold; color:white;">{sym}</span> <span style="color:#888; font-size:0.9rem; margin-left:8px;">{strat}</span></div>
-<div style="text-align:right;"><span style="color:{status_color}; font-weight:bold;">{status}</span></div>
-</div>
-</div>
-"""
-                st.markdown(header_html, unsafe_allow_html=True)
-                
-                # 中间部分：PnL & Price (使用原生 Columns)
-                c_pnl, c_price, c_id = st.columns([2, 2, 2])
-                
-                with c_pnl:
-                    if status == "OPEN":
-                        pnl = t.get('live_pnl', 0.0)
-                        pct = t.get('live_pnl_pct', 0.0)
-                        st.metric("PnL", f"${pnl:.2f}", f"{pct:.1f}%")
-                    else:
-                        st.caption("PnL: N/A (Working)")
-                
-                with c_price:
-                    # In V2, initial_cost IS the limit/fill price
-                    fill_val = float(limit)
-                    label = "Fill Price" if status == "OPEN" else "Limit Price"
-                    st.metric(label, f"${fill_val:.2f}")
-                    
-                with c_id:
-                    st.caption(f"ID: {t_id}")
-                    # [FIXED DATE DISPLAY]
-                    st.caption(f"Created: {created_display}")
+            # Prepare PnL HTML string
+            if status == "OPEN":
+                pnl = t.get('live_pnl', 0.0)
+                pct = t.get('live_pnl_pct', 0.0)
+                cls = "t-pnl-pos" if pnl >= 0 else "t-pnl-neg"
+                pnl_html = f"<span class='{cls}'>${pnl:.0f} ({pct:.1f}%)</span>"
+            else:
+                pnl_html = "<span class='t-pnl-neutral'>--</span>"
 
-                # 下半部分：Legs Detail (原生渲染)
-                # [NEW] Enhanced Legs Detail with Live Price (V2 DB Structure)
-                with st.expander("Legs Detail", expanded=True):
-                    legs_list = t.get('legs', [])
-                    
-                    if legs_list:
-                        for leg in legs_list:
-                            act = str(leg.get('action', '')).upper()
-                            ratio = leg.get('ratio')
-                            exp = leg.get('exp_date')
-                            strike = leg.get('strike')
-                            op_type = leg.get('op_type')
-                            live_px = leg.get('live_price')
-                            
-                            # [NEW] 3-Column Layout: Icon | Details | Live Price
-                            col_icon, col_txt, col_px = st.columns([0.5, 6, 2])
-                            
-                            with col_icon:
-                                st.write("🟢" if act == "BUY" else "🔴")
-                            with col_txt:
-                                st.markdown(f"**{act} {ratio}x** {exp} **{strike} {op_type}**")
-                            with col_px:
-                                if live_px is not None:
-                                    st.markdown(f"<span style='color:#ffd700; font-family:monospace;'>Mkt: ${live_px:.2f}</span>", unsafe_allow_html=True)
-                                else:
-                                    st.caption("-")
-                    else:
-                        st.write("Details unavailable")
+            status_border = "border-working" if status=="WORKING" else "border-open"
+            status_badge_cls = "st-working" if status=="WORKING" else "st-open"
 
-                # 底部：操作按钮 (4列布局)
-                c_input, c_confirm, c_cancel, c_space = st.columns([0.8, 0.8, 0.8, 2])
+            # 1. Compact Header Row (HTML)
+            header_html = f"""
+            <div class="trade-row {status_border}">
+                <div>
+                    <span class="t-sym">{sym}</span>
+                    <span class="t-strat">{strat}</span>
+                    <span class="t-meta">#{t_id} {created_display}</span>
+                </div>
+                <div class="t-right">
+                    {pnl_html}
+                    <span class="t-price">${limit:.2f}</span>
+                    <span class="t-status {status_badge_cls}">{status}</span>
+                </div>
+            </div>
+            """
+            st.markdown(textwrap.dedent(header_html), unsafe_allow_html=True)
+            
+            # 2. Hidden Details (Expander)
+            with st.expander("Manage / Details"):
+                # Legs Table
+                legs_list = t.get('legs', [])
+                if legs_list:
+                    for leg in legs_list:
+                        act = str(leg.get('action', '')).upper()
+                        ratio = leg.get('ratio')
+                        exp = leg.get('exp_date')
+                        strike = leg.get('strike')
+                        op_type = leg.get('op_type')
+                        live_px = leg.get('live_price')
+                        leg_pnl = leg.get('leg_pnl')
+                        
+                        icon = "🟢" if act == "BUY" else "🔴"
+                        c_a, c_b, c_c, c_d = st.columns([0.5, 5, 2, 2])
+                        c_a.write(icon)
+                        c_b.caption(f"**{act} {ratio}x** {exp} **{strike} {op_type}**")
+                        if live_px is not None: c_c.caption(f"Mkt ${live_px:.2f}")
+                        if leg_pnl is not None: 
+                            p_col = "green" if leg_pnl >=0 else "red"
+                            c_d.markdown(f":{p_col}[${leg_pnl:.0f}]")
                 
+                # Buttons
+                c_act1, c_act2, c_act3, c_act4 = st.columns([1, 1, 3, 1])
                 if status == "WORKING":
-                    with c_input:
-                        fill_price = st.number_input("Fill Px", value=float(limit), key=f"fp_{t_id}", label_visibility="collapsed")
-                    with c_confirm:
-                        if st.button("Confirm Fill", key=f"btn_fill_{t_id}", use_container_width=True):
-                            db.update_trade_status(t_id, "OPEN", fill_price)
+                    with c_act1:
+                        fill_px = st.number_input("Fill Px", value=limit, key=f"f_{t_id}", label_visibility="collapsed")
+                    with c_act2:
+                        if st.button("Fill", key=f"b_fill_{t_id}"):
+                            db.update_trade_status(t_id, "OPEN", fill_px)
+                            if 'legs' in t: db.update_leg_entry_prices(t_id, t['legs'])
                             st.rerun()
-                    with c_cancel:
-                        if st.button("Cancel Order", key=f"btn_cancel_{t_id}", use_container_width=True):
-                            db.update_trade_status(t_id, "CLOSED")
-                            st.rerun()
+                    with c_act4:
+                        if st.button("Cancel", key=f"b_can_{t_id}"):
+                            db.update_trade_status(t_id, "CLOSED"); st.rerun()
                 elif status == "OPEN":
-                    with c_input:
-                        # Use the first column slot for the Close button for alignment
-                        if st.button("Close Trade", key=f"btn_close_{t_id}", use_container_width=True):
-                            db.update_trade_status(t_id, "CLOSED")
-                            st.rerun()
-                
-                st.divider()
+                    with c_act4:
+                        if st.button("Close", key=f"b_cls_{t_id}"):
+                            db.update_trade_status(t_id, "CLOSED"); st.rerun()
+            
+            # Tiny spacer between cards
+            st.markdown("<div style='margin-bottom: 8px;'></div>", unsafe_allow_html=True)
 
-# -----------------
-# Auto Refresh Logic
-# -----------------
-if st.session_state.auto_refresh:
-    time_elapsed = time.time() - st.session_state.last_refresh_time
-    if time_elapsed > 300:
-        load_radar_with_deltas.clear()
-        st.session_state.last_refresh_time = time.time()
-        st.rerun()
+if st.session_state.auto_refresh and time.time() - st.session_state.last_refresh_time > 300:
+    load_radar_with_deltas.clear()
+    st.session_state.last_refresh_time = time.time()
+    st.rerun()

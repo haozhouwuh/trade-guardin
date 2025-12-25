@@ -203,3 +203,31 @@ class PersistenceManager:
             conn.commit()
         finally:
             conn.close()
+
+
+    # [NEW] 批量更新腿部的开仓价格 (用于 Confirm Fill 时记录单腿成本)
+    def update_leg_entry_prices(self, trade_id: int, legs_data: list):
+        """
+        legs_data: list of dicts, must contain 'leg_index' and 'live_price'
+        """
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        try:
+            for leg in legs_data:
+                # 注意：这里我们把 live_price (当前市价) 作为 entry_price (入场价) 保存
+                price = float(leg.get('live_price', 0.0) or 0.0)
+                idx = leg.get('leg_index')
+                
+                if idx is not None:
+                    c.execute("""
+                        UPDATE trade_legs 
+                        SET entry_price = ? 
+                        WHERE trade_id = ? AND leg_index = ?
+                    """, (price, trade_id, idx))
+            
+            conn.commit()
+            print(f"💾 [DB] Updated Leg Entry Prices for Trade {trade_id}")
+        except Exception as e:
+            print(f"❌ [DB Error] Failed to update leg prices: {e}")
+        finally:
+            conn.close()
