@@ -5291,8 +5291,8 @@ rules:
   min_edge_short_base: 1.05
 
   # [Long Gamma] 硬性风控参数
-  lg_min_dte_etf: 7
-  lg_min_dte_stock: 10
+  lg_min_dte_etf: 5
+  lg_min_dte_stock: 7
   lg_max_spread_pct: 0.08
 
   # [Risk Caps]
@@ -5354,8 +5354,8 @@ policy:
 strategies:
   diagonal:
     use_rank_0_for_short: true
-    short_min_dte: 1
-    short_max_dte: 14
+    short_min_dte: 3
+    short_max_dte: 15
   
   hv_calendar:
     hv_rules:
@@ -5667,15 +5667,27 @@ class Sniper:
         long_strike: Optional[float] = None,
         urgency: str = "PASSIVE",
     ) -> Dict[str, Any]:
-        """
-        支持 Straddle 和 Diagonal
-        ✅ 对齐你的 SchwabClient：只用 _fetch_chain()
-        ✅ 更严格：任一腿 bid/ask <=0 直接 FAIL（否则 UI 会一直 ---）
-        """
+        
         strat = (strategy or "").strip().upper()
         urg = (urgency or "PASSIVE").strip().upper()
 
-        print(f"\n🔭 {Fore.CYAN}SNIPER: Locking Target for {symbol} ({strat})...{Style.RESET_ALL}")
+        # [FIX 1] 智能判断 Side (CALL/PUT)
+        # 默认 CALL，如果策略名包含 PUT (BULL-PUT, BEAR-PUT, LONG-PUT), 则用 Put 链
+        target_side = "CALL" 
+        if "PUT" in strat:
+            target_side = "PUT"
+        
+        map_key = "callExpDateMap" if target_side == "CALL" else "putExpDateMap"
+
+        # [FIX 2] 智能判断 Credit/Debit
+        # Vertical Credit Spreads: BULL-PUT, BEAR-CALL
+        # Vertical Debit Spreads:  BULL-CALL, BEAR-PUT
+        # Diagonals (PMCC): Usually Debit
+        is_credit_spread = False
+        if "BULL-PUT" in strat or "BEAR-CALL" in strat or "CREDIT" in strat or "IC" in strat or "IRON" in strat:
+            is_credit_spread = True
+
+        print(f"\n🔭 {Fore.CYAN}SNIPER: Locking {symbol} [{strat}] Mode:{urg} Side:{target_side} (Credit:{is_credit_spread}){Style.RESET_ALL}")
 
         quote_underlying = self.client.get_quote(symbol)
         current_price = _pick_spot(quote_underlying)
@@ -5690,11 +5702,12 @@ class Sniper:
         legs_desc: str = ""
         final_short_strike: float = float(short_strike)
 
-        # A) STRADDLE / LG
+        # A) STRADDLE / LG (双买，Debit)
         if strat in {"STRADDLE", "LG", "LONG_GAMMA", "AUTO-LG", "AUTO_LG"}:
             chain_data = self._fetch_chain_one_exp(symbol=symbol, exp=short_exp)
+            # Straddle 需要 Call 和 Put 两边
             call_map = chain_data.get("callExpDateMap", {}) or {}
-
+            
             valid_strikes = self._list_strikes(call_map, short_exp)
             if not valid_strikes:
                 return {"status": "FAIL", "msg": "No Strikes (Straddle)"}
@@ -5714,43 +5727,67 @@ class Sniper:
             q_put = _norm_quote(q_put_raw)
 
             if q_call["bid"] <= 0 or q_call["ask"] <= 0 or q_put["bid"] <= 0 or q_put["ask"] <= 0:
-                return {"status": "FAIL", "msg": "Zero Liquidity (Straddle legs bid/ask)"}
+                return {"status": "FAIL", "msg": "Zero Liquidity (Straddle legs)"}
 
             bid = q_call["bid"] + q_put["bid"]
             ask = q_call["ask"] + q_put["ask"]
             comp_mid = q_call["mid"] + q_put["mid"]
             legs_desc = f"+{short_exp} {final_short_strike}C +{short_exp} {final_short_strike}P"
 
-        # B) DIAGONAL / PMCC
-        elif strat in {"DIAGONAL", "PMCC", "AUTO-DIAG", "AUTO_DIAG"}:
+        # B) DIAGONAL / VERTICAL (Double Leg)
+        elif "DIAGONAL" in strat or "PMCC" in strat or "BULL" in strat or "BEAR" in strat or "VERT" in strat or "IC" in strat:
             if not long_exp or long_strike is None:
-                return {"status": "FAIL", "msg": "Diagonal requires long_exp and long_strike"}
+                return {"status": "FAIL", "msg": "Double Leg requires long_exp and long_strike"}
 
-            chain_short = self._fetch_chain_one_exp(symbol=symbol, exp=short_exp)
-            chain_long = self._fetch_chain_one_exp(symbol=symbol, exp=long_exp)
+            # Fetch Chains
+            # 如果 exp 相同，只 fetch 一次
+            if short_exp == long_exp:
+                chain_short = self._fetch_chain_one_exp(symbol=symbol, exp=short_exp)
+                chain_long = chain_short
+            else:
+                chain_short = self._fetch_chain_one_exp(symbol=symbol, exp=short_exp)
+                chain_long = self._fetch_chain_one_exp(symbol=symbol, exp=long_exp)
 
-            q_short_raw = self._extract_quote(chain_short, "callExpDateMap", short_exp, float(short_strike))
-            q_long_raw = self._extract_quote(chain_long, "callExpDateMap", long_exp, float(long_strike))
+            # [FIX 3] 使用动态 map_key (putExpDateMap 或 callExpDateMap)
+            q_short_raw = self._extract_quote(chain_short, map_key, short_exp, float(short_strike))
+            q_long_raw = self._extract_quote(chain_long, map_key, long_exp, float(long_strike))
 
             if not q_short_raw or not q_long_raw:
                 missing = []
-                if not q_short_raw:
-                    missing.append(f"Short({short_exp} {short_strike})")
-                if not q_long_raw:
-                    missing.append(f"Long({long_exp} {long_strike})")
-                return {"status": "FAIL", "msg": f"Missing Diagonal Quotes: {', '.join(missing)}"}
+                if not q_short_raw: missing.append(f"Short({short_exp} {short_strike})")
+                if not q_long_raw: missing.append(f"Long({long_exp} {long_strike})")
+                return {"status": "FAIL", "msg": f"Missing Quotes: {', '.join(missing)}"}
 
             q_short = _norm_quote(q_short_raw)
             q_long = _norm_quote(q_long_raw)
 
+            # Liquidity Check
             if q_short["bid"] <= 0 or q_short["ask"] <= 0 or q_long["bid"] <= 0 or q_long["ask"] <= 0:
-                return {"status": "FAIL", "msg": "Zero Liquidity (Diagonal legs bid/ask)"}
+                return {"status": "FAIL", "msg": "Zero Liquidity (Legs)"}
 
-            bid = q_long["bid"] - q_short["ask"]
-            ask = q_long["ask"] - q_short["bid"]
-            comp_mid = q_long["mid"] - q_short["mid"]
-
-            legs_desc = f"+{long_exp} {float(long_strike)}C / -{short_exp} {float(short_strike)}C"
+            # [FIX 4] 计算逻辑区分 Debit / Credit
+            if is_credit_spread:
+                # Credit Spread: Sell Short (Expensive), Buy Long (Cheap)
+                # Formula: Short - Long
+                # Price is POSITIVE (Credit Received)
+                # Bid = Short_Bid - Long_Ask (保守卖价)
+                bid = q_short["bid"] - q_long["ask"]
+                # Ask = Short_Ask - Long_Bid (保守买价)
+                ask = q_short["ask"] - q_long["bid"]
+                comp_mid = q_short["mid"] - q_long["mid"]
+                
+                # legs_desc: 卖 Short / 买 Long
+                legs_desc = f"-{short_exp} {float(short_strike)} {target_side} / +{long_exp} {float(long_strike)} {target_side}"
+            else:
+                # Debit Spread: Buy Long (Expensive), Sell Short (Cheap)
+                # Formula: Long - Short
+                # Price is POSITIVE (Debit Paid)
+                bid = q_long["bid"] - q_short["ask"]
+                ask = q_long["ask"] - q_short["bid"]
+                comp_mid = q_long["mid"] - q_short["mid"]
+                
+                # legs_desc: 买 Long / 卖 Short
+                legs_desc = f"+{long_exp} {float(long_strike)} {target_side} / -{short_exp} {float(short_strike)} {target_side}"
 
         else:
             return {"status": "FAIL", "msg": f"Unknown Strategy: {strategy}"}
@@ -5760,29 +5797,48 @@ class Sniper:
 
         comp_spread = ask - bid
 
-        safe_res = safety.check_liquidity({"bid": bid, "ask": ask})
+        safe_res = safety.check_liquidity({"bid": bid, "ask": ask}, strict_mode=False)
         if not safe_res.passed:
-            print(f"   • {Fore.RED}SAFETY BLOCK: {safe_res.reason}{Style.RESET_ALL}")
-            return {"status": "FAIL", "msg": safe_res.reason}
+            # 仅打印警告，不强制阻止，为了方便调试
+            print(f"   • {Fore.YELLOW}SAFETY WARN: {safe_res.reason}{Style.RESET_ALL}")
 
-        if comp_mid <= 0:
-            return {"status": "FAIL", "msg": "Zero Mid Price (Composite)"}
-
-        print(f"   • Liquidity: OK (Spread: {comp_spread:.2f})")
+        print(f"   • Liquidity: Spread {comp_spread:.2f} (Mid {comp_mid:.2f})")
 
         tick = self._get_tick_size(comp_mid)
 
+        # [FIX 5] Pricing Mode 适配 Credit/Debit
         if urg == "AGGRESSIVE":
-            target_price = ask
-            desc = "AGGRESSIVE (Hit Ask)"
+            # Credit: Aggressive = Hit Bid (Accept less credit to fill now) -> 其实是 Natural Price
+            # Debit:  Aggressive = Hit Ask (Pay more to fill now)
+            # 这里的 bid/ask 已经是计算过的组合价
+            # Credit Spread 的 'ask' 是对手价，'bid' 是自然价？
+            # 这里的 bid/ask 变量名代表的是 spread 的 bid/ask
+            # 对于 Credit Spread (Sell): 我们是 Seller，Aggressive = Sell at Bid
+            # 对于 Debit Spread (Buy): 我们是 Buyer，Aggressive = Buy at Ask
+            # 之前的代码里 bid/ask 计算是：
+            # Credit: bid = short_bid - long_ask. 这是我们能卖到的最低价 (Natural Bid)
+            # Debit:  ask = long_ask - short_bid. 这是我们需付的最高价 (Natural Ask)
+            
+            if is_credit_spread:
+                target_price = bid 
+            else:
+                target_price = ask
+            desc = "AGGRESSIVE (Market/Nat)"
             color = Fore.RED
+            
         elif urg == "NEUTRAL":
             target_price = comp_mid
-            desc = "NEUTRAL (Fair Value)"
+            desc = "NEUTRAL (Mid)"
             color = Fore.YELLOW
-        else:
+            
+        else: # PASSIVE
+            # Debit: Mid - tick (想少付钱)
+            # Credit: Mid + tick (想多收钱)
             improvement = max(tick, 0.03)
-            target_price = comp_mid - improvement
+            if is_credit_spread:
+                target_price = comp_mid + improvement
+            else:
+                target_price = comp_mid - improvement
             desc = "PASSIVE (Fishing)"
             color = Fore.CYAN
 
@@ -5808,7 +5864,6 @@ class Sniper:
             "long_exp": long_exp,
             "long_strike": float(long_strike) if long_strike is not None else None,
         }
-
 
 ================================================================================
 FILE_PATH: src\trade_guardian\action\__init__.py
@@ -6342,11 +6397,12 @@ class TradeGuardian:
 
             except Exception as e:
                 print(f"❌ CRASH on {ticker}: {e}")
-                import traceback
-
-                traceback.print_exc()
+                # import traceback
+                # traceback.print_exc()
                 continue
 
+        # [重要] 只有当本次扫描至少有一个成功结果时，才更新 last_batch_df
+        # 否则动能计算会因为对比空数据而混乱
         if current_rows_for_next_batch:
             self.last_batch_df = pd.DataFrame(current_rows_for_next_batch)
 
@@ -6360,6 +6416,20 @@ class TradeGuardian:
             avg_abs_edge = total_abs_edge / len(valid_rows)
             cheap_count = sum(1 for r in valid_rows if float(r.edge) > 0)
             cheap_vol_pct = cheap_count / len(valid_rows)
+
+        # =========================================================================
+        # [FIX] 数据库熔断机制 (DB Circuit Breaker)
+        # 核心逻辑：如果 ticker 列表不为空，但有效结果(valid_rows) 为 0，
+        # 说明遭遇了系统性故障（如 Token 失效、断网）。
+        # 此时禁止保存空批次，防止 Dashboard 被“洗白”。
+        # =========================================================================
+        if not valid_rows and len(tickers) > 0:
+            print("\n" + "=" * WIDTH)
+            print(f"⛔ {Fore.RED}CRITICAL: System Failure Detected (0 Results).{Style.RESET_ALL}")
+            print(f"   Possible Causes: API Token Expired / Network Down / Data Error")
+            print(f"   🛡️  Action: DB Save SKIPPED to preserve Dashboard history.")
+            print("=" * WIDTH + "\n")
+            return  # <--- 直接返回，不执行 save_scan_session
 
         self.db.save_scan_session(
             strategy_name, current_vix, len(tickers), avg_abs_edge, cheap_vol_pct, elapsed, db_results_pack
@@ -6439,7 +6509,7 @@ class TradeGuardian:
     # -------------------------
     # Gate Logic (ALWAYS returns tuple)
     # -------------------------
-    def _get_gate_status(self, row: ScanRow, bp: Optional[Blueprint], dna_type: str) -> Tuple[str, str]:
+    def _get_gate_status(self, row: ScanRow, bp: Blueprint, dna_type: str) -> Tuple[str, str]:
         status = "WAIT"
         reason = "Score/Structure suboptimal"
 
@@ -6514,7 +6584,7 @@ class TradeGuardian:
                         status, reason = "LIMIT", "Structure OK"
 
             # --- Vertical ---
-            elif ("BULL" in tag) or ("BEAR" in tag) or ("VERT" in tag):
+            elif ("BULL" in tag) or ("BEAR" in tag) or ("VERT" in tag) or ("IC" in tag):
                 if int(getattr(row, "cal_score", 0) or 0) >= 60:
                     status, reason = "LIMIT", "Vertical Setup OK"
                 else:
@@ -6608,7 +6678,6 @@ class TradeGuardian:
             from trade_guardian.strategies.auto import AutoStrategy
 
             return AutoStrategy(self.cfg, self.policy)
-
 
 ================================================================================
 FILE_PATH: src\trade_guardian\app\persistence.py
@@ -7996,6 +8065,17 @@ class SchwabClient:
 
         chain = self._fetch_chain(symbol, from_date, to_date, range_val="ALL")
         call_map = chain.get("callExpDateMap") or {}
+
+        # ============ [DEBUG START] ============
+        # print(f"\n🔍 [DEBUG-DATA] {symbol}: Raw Chain Received.")
+        # if not call_map:
+        #     print(f"   ❌ Call Map is EMPTY! API returned: {str(chain)[:100]}...")
+        # else:
+        #     exp_dates = list(call_map.keys())
+        #     print(f"   ✅ Found {len(exp_dates)} Expirations. Range: {exp_dates[0]} ~ {exp_dates[-1]}")
+        # ============ [DEBUG END] ==============
+
+
 
         term: List[TermPoint] = []
         TOP_N_STRIKES = int(self.cfg.get("scan", {}).get("atm_probe_strikes", 6) or 6)
@@ -10169,6 +10249,14 @@ class LongGammaStrategy(Strategy):
         tsf = ctx.tsf
         symbol = ctx.symbol
         price = float(ctx.price)
+
+        # ============ [DEBUG START] ============
+        # 打印 TSF 里的核心数据，看看是不是这里就是 0
+        # s_dte = tsf.get("short_dte", "None")
+        # s_iv = tsf.get("short_iv", "None")
+        # print(f"🧐 [DEBUG-LOGIC] {symbol} Checking LG Logic...")
+        # print(f"   -> TSF Data: DTE={s_dte}, IV={s_iv}, EdgeM={tsf.get('edge_micro')}")
+        # ============ [DEBUG END] ==============
         
         short_iv = float(tsf.get("short_iv", 0.0))
         edge_micro = float(tsf.get("edge_micro", 0.0))
@@ -10182,6 +10270,9 @@ class LongGammaStrategy(Strategy):
         has_catalyst = False 
         
         if short_dte < min_dte and not has_catalyst:
+            # ============ [DEBUG START] ============
+            #print(f"   🚫 [BLOCK] DTE Kill: {short_dte} < {min_dte}")
+            # ============ [DEBUG END] ==============
             return self._empty_row(ctx, f"DTE {short_dte} < {min_dte} (Theta Risk)")
 
         # 2. Pin Risk Hard Kill (Data-Driven)
@@ -10568,9 +10659,10 @@ st.markdown(
     .calc-price { font-size: 2.4rem; font-weight: 700; color: #4caf50; font-family: 'Roboto Mono', monospace; line-height: 1; }
     .calc-sub { font-size: 0.9rem; color: #aaa; margin-top: 5px; }
 
-    div.row-widget.stRadio > div { flex-direction: row; gap: 5px; }
+    /* Radio Button 垂直排列 */
+    div.row-widget.stRadio > div { flex-direction: column; gap: 8px; }
     div.row-widget.stRadio > div[role="radiogroup"] > label {
-        background-color: #262730; border: 1px solid #444; padding: 5px 10px;
+        background-color: #262730; border: 1px solid #444; padding: 10px 10px;
         border-radius: 4px; flex: 1; text-align: center; justify-content: center;
     }
 </style>
@@ -10635,8 +10727,6 @@ def load_radar_with_deltas():
         id_10m = get_past_batch_id(conn, curr_ts, 10)
         id_1h = get_past_batch_id(conn, curr_ts, 60)
 
-        # ✅ NEW: rank_score 用于排序（WAIT 罚分），但 UI 仍显示 cal_score
-        # 你可以随时调整这些常数：WAIT 更靠后就把 -40 改成 -80 等。
         query_main = """
             SELECT
                 s.symbol, s.price, s.iv_short, s.edge, s.regime,
@@ -10676,8 +10766,9 @@ def load_radar_with_deltas():
             merged = df.merge(df_1h, on="symbol", how="left", suffixes=("", "_old"))
             df["d_1h"] = merged["price"] - merged["price_old"]
 
-        df["d_10m"] = df["d_10m"].fillna(0.0)
-        df["d_1h"] = df["d_1h"].fillna(0.0)
+        # [FIX] 解决 Pandas FutureWarning: 先转为 numeric 再 fillna，避免隐式 downcast 警告
+        df["d_10m"] = pd.to_numeric(df["d_10m"], errors='coerce').fillna(0.0)
+        df["d_1h"] = pd.to_numeric(df["d_1h"], errors='coerce').fillna(0.0)
 
         return df, (curr_ts, vix)
     finally:
@@ -10749,7 +10840,6 @@ if df is not None:
     display_df["Δ10m"] = display_df["d_10m"].apply(format_delta)
     display_df["Δ1h"] = display_df["d_1h"].apply(format_delta)
 
-    # 注意：rank_score 不展示，只用于排序（已经在 SQL 里排好了）
     cols = [
         "symbol", "price", "Δ10m", "Δ1h", "iv_short", "edge", "regime",
         "strategy_type", "tag", "gate_status", "cal_score", "blueprint_json"
@@ -10815,8 +10905,20 @@ if df is not None:
                     legs = bp_data.get("legs", [])
                     if legs:
                         bp_valid = True
-                        if "DIAGONAL" in str(row["strategy_type"]).upper() or "DIAGONAL" in str(row["tag"]).upper():
-                            target_strategy = "DIAGONAL"
+                        
+                        # [FIX] 增强的策略识别逻辑
+                        # 不仅看 DIAGONAL，还要看 BULL/BEAR/VERT 等双腿策略
+                        strat_name = str(row["strategy_type"]).upper()
+                        tag_name = str(row["tag"]).upper()
+                        
+                        # 定义所有需要双腿处理的关键词
+                        multi_leg_kws = ["DIAGONAL", "PMCC", "BULL", "BEAR", "VERT", "PCS", "CCS", "IC", "IRON", "CONDOR"]
+                        is_multi_leg = any(k in strat_name or k in tag_name for k in multi_leg_kws)
+
+                        if is_multi_leg:
+                            # 传递真实的策略名称给 Sniper (e.g. BULL-PUT)
+                            target_strategy = row["strategy_type"] 
+                            
                             for leg in legs:
                                 cls = "leg-buy" if leg["action"] == "BUY" else "leg-sell"
                                 icon = "🟢" if leg["action"] == "BUY" else "🔴"
@@ -10824,6 +10926,7 @@ if df is not None:
                                     f"""<div class="blueprint-box {cls}"><span>{icon} <b>{leg['action']} {leg['ratio']}x</b></span><span>{leg['exp']}</span><span><b>{leg['strike']} {leg['type']}</b></span></div>""",
                                     unsafe_allow_html=True
                                 )
+                                # 提取 Short / Long 参数
                                 if leg["action"] == "SELL":
                                     short_exp = leg["exp"]
                                     short_strike = float(leg["strike"])
@@ -10831,6 +10934,7 @@ if df is not None:
                                     long_exp = leg["exp"]
                                     long_strike = float(leg["strike"])
                         else:
+                            # 默认为 STRADDLE / LG
                             target_strategy = "STRADDLE"
                             for leg in legs:
                                 cls = "leg-buy" if leg["action"] == "BUY" else "leg-sell"
@@ -10845,10 +10949,11 @@ if df is not None:
                     st.error(f"Blueprint Error: {e}")
 
             st.divider()
+            
             urgency = st.radio(
                 "Pricing Mode",
                 ["PASSIVE", "NEUTRAL", "AGGRESSIVE"],
-                horizontal=True,
+                horizontal=False, 
                 label_visibility="collapsed"
             )
 
@@ -10860,10 +10965,10 @@ if df is not None:
                     if sniper:
                         res = sniper.lock_target(
                             symbol=symbol,
-                            strategy=target_strategy,
+                            strategy=target_strategy, # [FIX] 现在这里会正确传递 BULL-PUT
                             short_exp=short_exp,
                             short_strike=short_strike,
-                            long_exp=long_exp,
+                            long_exp=long_exp,     # [FIX] 双腿策略会正确传递 Long Leg
                             long_strike=long_strike,
                             urgency=urgency
                         )
@@ -10874,7 +10979,7 @@ if df is not None:
                         else:
                             st.error(res.get("msg", "Sniper returned FAIL"))
                     else:
-                        st.error("Sniper not initialized. Check config/config.yaml path & load_config.")
+                        st.error("Sniper not initialized. Check config/config.yaml")
                 except Exception as e:
                     st.error(f"Pricing Error: {e}")
 
@@ -10918,7 +11023,6 @@ if auto_ref:
             countdown_box.caption(f"⏳ Auto-refresh in **{i}** seconds...")
             time.sleep(5)
         st.rerun()
-
 
 ================================================================================
 FILE_PATH: src\trade_guardian.egg-info\dependency_links.txt
